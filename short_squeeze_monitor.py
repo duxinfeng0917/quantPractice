@@ -363,9 +363,9 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
 
     if all_recent_positive and had_earlier_negative:
         pts = 25
-        total_inflow = sum(recent)
+        total_inflow = sum(recent) / 10000
         msg = (f"大单净流入反转：连续 {BIGFLOW_REVERSAL_MIN} 轮正值 "
-               f"累计 {total_inflow:+,.0f} 万港元 [+{pts}分]")
+               f"累计 {total_inflow:+,.1f} 万港元 [+{pts}分]")
         score += pts
         signals.append(msg)
         log.warning(f"[资金反转] {msg}")
@@ -383,7 +383,7 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
         avg_prev = statistics.mean(recent[1:]) if len(recent) > 1 else recent[0]
         if avg_prev > 0 and recent[0] > avg_prev * 2:
             pts = 8
-            msg = f"大单净流入加速：本轮 {recent[0]:+,.0f} 万 vs 均值 {avg_prev:+,.0f} 万 [+{pts}分]"
+            msg = f"大单净流入加速：本轮 {recent[0]/10000:+,.1f} 万 vs 均值 {avg_prev/10000:+,.1f} 万 [+{pts}分]"
             score += pts
             signals.append(msg)
 
@@ -558,7 +558,7 @@ def print_dashboard(state: MonitorState, score: int, signals: list[str]):
 ║  最新价         : {str(state.last_price or 'N/A'):>10}                        ║
 ╠══════════════════════════════════════════════════════════╣
 ║  [①] HKEX 卖空占比 (今日)  : {str(state.latest_hkex_ratio or 'N/A'):>8} %               ║
-║  [②] 大单净流入 (累计)      : {str(f"{state.latest_big_net:+,.0f} 万" if state.latest_big_net is not None else "N/A"):>16}             ║
+║  [②] 大单净流入 (累计)      : {str(f"{state.latest_big_net/10000:+,.1f} 万" if state.latest_big_net is not None else "N/A"):>16}             ║
 ║  [③] 卖盘深度               : {str(f"{state.latest_ask_depth:,.0f} 股" if state.latest_ask_depth is not None else "N/A"):>16}             ║
 ║      摆盘失衡度             : {str(f"{state.latest_imbalance:+.3f}" if state.latest_imbalance is not None else "N/A"):>8}                  ║
 ╠══════════════════════════════════════════════════════════╣
