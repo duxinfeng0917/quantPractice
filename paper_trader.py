@@ -23,6 +23,10 @@ MINIMAX-W (HK.00100) 模拟账户自动做空交易机器人
     · 第二目标价          → 全部平仓（动态：入场价 × 0.97）
     · 第一目标价          → 平仓 50%，止损上移至入场价（动态：入场价 × 0.985）
 
+收盘保护：
+    · 15:50 HKT 后不再累积新仓位确认轮数（CLOSE_GUARD_TIME）
+    · 已持仓的平仓逻辑不受影响，继续正常运行
+
 依赖：
     pip install futu-api
 
@@ -69,15 +73,17 @@ SIM_ACC_ID    = 18982257
 SIM_ENV       = TrdEnv.SIMULATE
 SIM_MARKET    = TrdMarket.HK
 
-DB_PATH       = "short_data.db"       # 与 short_squeeze_monitor.py 共享
-TRADER_LOG    = "paper_trader.log"
-POLL_INTERVAL = 60                    # 轮询秒数
+DB_PATH            = "short_data.db"       # 与 short_squeeze_monitor.py 共享
+TRADER_LOG         = "paper_trader.log"
+TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
+POLL_INTERVAL      = 60                    # 轮询秒数
 
 # ── 入场条件 ──────────────────────────────────────────────
 HIGH_ENTRY_SCORE    = 65              # 最低入场评分
 SAFE_SQUEEZE_SCORE  = 20             # 最大允许逼空评分
 ENTRY_IMB_THRESHOLD = 0.60           # 失衡度低于此值才允许入场（排除极度偏多）
 ENTRY_CONFIRM_ROUNDS = 2             # 连续 ENTRY 信号轮数
+CLOSE_GUARD_TIME = datetime.time(15, 50)  # 此时间后禁止开新仓（HKT）
 
 # ── 仓位管理 ──────────────────────────────────────────────
 FULL_QTY   = 1000                     # 满仓股数
@@ -124,6 +130,49 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════
+# 二b、热更新配置
+# ═══════════════════════════════════════════════════════════
+def load_config() -> dict:
+    """
+    从 trader_config.json 读取可热更新的阈值参数。
+    文件不存在或解析失败时返回空字典，调用方使用模块级常量作为兜底。
+
+    支持的字段（均可省略，省略则使用代码默认值）：
+        HIGH_ENTRY_SCORE    int    最低入场评分（默认 65）
+        SAFE_SQUEEZE_SCORE  int    最大允许逼空评分（默认 20）
+        ENTRY_IMB_THRESHOLD float  失衡度上限（默认 0.60）
+        ENTRY_CONFIRM_ROUNDS int   连续确认轮数（默认 2）
+        EMERGENCY_SQUEEZE   int    紧急平仓逼空阈值（默认 35）
+        CLOSE_GUARD_TIME    str    收盘禁开仓时间 "HH:MM"（默认 "15:50"）
+        TARGET1_PCT         float  第一目标跌幅（默认 0.015）
+        TARGET2_PCT         float  第二目标跌幅（默认 0.030）
+        STOP_PCT            float  止损涨幅（默认 0.040）
+        REVERSAL_IMB_THRESHOLD float 反转失衡阈值（默认 0.75）
+    """
+    import json
+    try:
+        with open(TRADER_CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning(f"[配置] 读取 {TRADER_CONFIG_FILE} 失败: {e}，使用默认值")
+        return {}
+
+
+def _cfg_time(cfg: dict, key: str, default: datetime.time) -> datetime.time:
+    """从配置字典中解析 'HH:MM' 格式时间，失败时返回 default。"""
+    raw = cfg.get(key)
+    if not raw:
+        return default
+    try:
+        h, m = raw.split(":")
+        return datetime.time(int(h), int(m))
+    except Exception:
+        return default
 
 
 # ═══════════════════════════════════════════════════════════
@@ -606,12 +655,20 @@ def print_dashboard(bot: BotState, price: Optional[float],
         n = min(int(v / 100 * width), width)
         return "█" * n + "░" * (width - n)
 
-    mode_tag = " [DRY-RUN]" if dry_run else " [LIVE-SIM]"
+    close_guard = datetime.datetime.now().time() >= CLOSE_GUARD_TIME
+    if dry_run:
+        mode_tag = " [DRY-RUN]"
+    elif close_guard:
+        mode_tag = " [CLOSE-GUARD]"
+    else:
+        mode_tag = " [LIVE-SIM]"
 
     print(f"\n╔══════════════════════════════════════════════════════════╗")
     print(f"║  MINIMAX-W 模拟自动交易  {now}{mode_tag:<16}  ║")
     print(f"╠══════════════════════════════════════════════════════════╣")
-    print(f"║  状态：{state_str:<12}  确认轮: {bot.confirm_rounds}/{ENTRY_CONFIRM_ROUNDS}                  ║")
+    confirm_str = f"确认轮: {bot.confirm_rounds}/{ENTRY_CONFIRM_ROUNDS}"
+    guard_str   = "  ⚠ 收盘禁开仓" if close_guard else ""
+    print(f"║  状态：{state_str:<12}  {confirm_str}{guard_str:<14}║")
     if price:
         print(f"║  当前价：{price:<8}  失衡度：{imbalance:+.3f}                        ║")
     print(f"╠══════════════════════════════════════════════════════════╣")
@@ -643,6 +700,7 @@ def detect_reversal_signal(
     conn: sqlite3.Connection,
     bot: BotState,
     imbalance: float,
+    rev_imb_threshold: float = REVERSAL_IMB_THRESHOLD,
 ) -> tuple[bool, bool, list[str]]:
     """
     检测做空信号是否反转（仅持仓时调用）。
@@ -685,7 +743,7 @@ def detect_reversal_signal(
     # ── 信号B：失衡度持续高位 ─────────────────────────────
     if len(bot.imb_history) >= REVERSAL_IMB_ROUNDS:
         recent_imb = bot.imb_history[-REVERSAL_IMB_ROUNDS:]
-        if all(v > REVERSAL_IMB_THRESHOLD for v in recent_imb):
+        if all(v > rev_imb_threshold for v in recent_imb):
             avg_imb = statistics.mean(recent_imb)
             triggered.append("B")
             reasons.append(
@@ -705,11 +763,17 @@ def detect_reversal_signal(
 def _calc_targets(entry: float, args) -> tuple[float, float, float]:
     """
     计算动态目标价和止损价。
-    命令行传入非零值时优先使用，否则按入场价百分比动态计算。
+    · 命令行传入非零值时优先使用（固定价）
+    · 否则使用 args._stop_pct / _t1_pct / _t2_pct（来自热更新配置）
+    · 最终兜底使用模块级常量
     """
-    stop    = args.stop    if args.stop    > 0 else round(entry * (1 + STOP_PCT),    1)
-    target1 = args.target1 if args.target1 > 0 else round(entry * (1 - TARGET1_PCT), 1)
-    target2 = args.target2 if args.target2 > 0 else round(entry * (1 - TARGET2_PCT), 1)
+    stop_pct = getattr(args, "_stop_pct", STOP_PCT)
+    t1_pct   = getattr(args, "_t1_pct",   TARGET1_PCT)
+    t2_pct   = getattr(args, "_t2_pct",   TARGET2_PCT)
+
+    stop    = args.stop    if args.stop    > 0 else round(entry * (1 + stop_pct), 1)
+    target1 = args.target1 if args.target1 > 0 else round(entry * (1 - t1_pct),  1)
+    target2 = args.target2 if args.target2 > 0 else round(entry * (1 - t2_pct),  1)
     return stop, target1, target2
 
 
@@ -745,7 +809,32 @@ def run(args):
     bot = BotState()
 
     try:
+        _last_cfg_log = ""   # 避免重复打印相同配置
         while True:
+            # ── 热更新配置 ────────────────────────────────────
+            cfg = load_config()
+            dyn_high_entry    = cfg.get("HIGH_ENTRY_SCORE",     HIGH_ENTRY_SCORE)
+            dyn_safe_squeeze  = cfg.get("SAFE_SQUEEZE_SCORE",   SAFE_SQUEEZE_SCORE)
+            dyn_imb_threshold = cfg.get("ENTRY_IMB_THRESHOLD",  ENTRY_IMB_THRESHOLD)
+            dyn_confirm_rounds= cfg.get("ENTRY_CONFIRM_ROUNDS", ENTRY_CONFIRM_ROUNDS)
+            dyn_emergency_sq  = cfg.get("EMERGENCY_SQUEEZE",    EMERGENCY_SQUEEZE)
+            dyn_close_guard   = _cfg_time(cfg, "CLOSE_GUARD_TIME", CLOSE_GUARD_TIME)
+            dyn_t1_pct        = cfg.get("TARGET1_PCT",          TARGET1_PCT)
+            dyn_t2_pct        = cfg.get("TARGET2_PCT",          TARGET2_PCT)
+            dyn_stop_pct      = cfg.get("STOP_PCT",             STOP_PCT)
+            dyn_rev_imb       = cfg.get("REVERSAL_IMB_THRESHOLD", REVERSAL_IMB_THRESHOLD)
+
+            cfg_summary = (
+                f"entry≥{dyn_high_entry} sq<{dyn_safe_squeeze} "
+                f"imb<{dyn_imb_threshold} confirm={dyn_confirm_rounds} "
+                f"guard={dyn_close_guard.strftime('%H:%M')} "
+                f"stop={dyn_stop_pct*100:.1f}% "
+                f"t1={dyn_t1_pct*100:.1f}% t2={dyn_t2_pct*100:.1f}%"
+            )
+            if cfg_summary != _last_cfg_log:
+                log.info(f"[配置] {cfg_summary}")
+                _last_cfg_log = cfg_summary
+
             # ── 拉取市场数据 ──────────────────────────────────
             price, ask_depth, bid_depth, imbalance = fetch_market_data(
                 quote_ctx, conn
@@ -773,12 +862,23 @@ def run(args):
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
             if bot.trader_state == TraderState.IDLE:
+                # ── 收盘保护：禁止开新仓（时间由配置决定）────
+                if datetime.datetime.now().time() >= dyn_close_guard:
+                    if bot.confirm_rounds > 0:
+                        log.info(
+                            f"[收盘保护] {dyn_close_guard.strftime('%H:%M')} 后禁止开仓，"
+                            f"重置确认计数"
+                        )
+                        bot.confirm_rounds = 0
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
                 # ── 入场信号判断 ──────────────────────────────
                 entry_ok = (
                     sig_type == "ENTRY"
-                    and entry_score >= HIGH_ENTRY_SCORE
-                    and squeeze_score < SAFE_SQUEEZE_SCORE
-                    and imbalance < ENTRY_IMB_THRESHOLD
+                    and entry_score >= dyn_high_entry
+                    and squeeze_score < dyn_safe_squeeze
+                    and imbalance < dyn_imb_threshold
                 )
                 if entry_ok:
                     bot.confirm_rounds += 1
@@ -786,19 +886,27 @@ def run(args):
                     bot.last_squeeze     = squeeze_score
                     bot.last_imbalance   = imbalance
                     log.info(
-                        f"[CONFIRM {bot.confirm_rounds}/{ENTRY_CONFIRM_ROUNDS}] "
+                        f"[CONFIRM {bot.confirm_rounds}/{dyn_confirm_rounds}] "
                         f"入场评分={entry_score} 逼空={squeeze_score} "
                         f"失衡={imbalance:.3f}"
                     )
-                    if bot.confirm_rounds >= ENTRY_CONFIRM_ROUNDS:
+                    if bot.confirm_rounds >= dyn_confirm_rounds:
                         # ── 确认入场，计算仓位并下单 ──────────
                         qty = (HALF_QTY if entry_score < 75 else FULL_QTY)
                         qty = min(qty, max_qty)
 
                         ok = place_short_order(trade_ctx, price, qty, dry_run)
                         if ok:
-                            # 动态计算目标价和止损
-                            dyn_stop, dyn_t1, dyn_t2 = _calc_targets(price, args)
+                            # 动态计算目标价和止损（使用本轮配置的百分比）
+                            _args_override = type("A", (), {
+                                "stop":    args.stop,
+                                "target1": args.target1,
+                                "target2": args.target2,
+                                "_t1_pct": dyn_t1_pct,
+                                "_t2_pct": dyn_t2_pct,
+                                "_stop_pct": dyn_stop_pct,
+                            })()
+                            dyn_stop, dyn_t1, dyn_t2 = _calc_targets(price, _args_override)
                             bot.position = Position(
                                 entry_price = price,
                                 qty         = qty,
@@ -860,9 +968,9 @@ def run(args):
                         bot.target1_done = False
 
                 # B：逼空紧急平仓
-                elif squeeze_score >= EMERGENCY_SQUEEZE:
+                elif squeeze_score >= dyn_emergency_sq:
                     log.warning(
-                        f"[紧急平仓] 逼空评分 {squeeze_score} ≥ {EMERGENCY_SQUEEZE}，"
+                        f"[紧急平仓] 逼空评分 {squeeze_score} ≥ {dyn_emergency_sq}，"
                         f"立即全部平仓 {pos.open_qty}股"
                     )
                     ok = place_cover_order(
@@ -885,7 +993,7 @@ def run(args):
                 # C：信号反转平仓（双信号全平，单信号减仓）
                 else:
                     full_rev, partial_rev, rev_reasons = detect_reversal_signal(
-                        conn, bot, imbalance
+                        conn, bot, imbalance, dyn_rev_imb
                     )
                     if full_rev and pos.open_qty > 0:
                         log.warning(
