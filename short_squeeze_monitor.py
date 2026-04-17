@@ -907,6 +907,162 @@ def analyze_short_exit(
 # ═══════════════════════════════════════════════════════════
 # 九、综合评分与仪表盘
 # ═══════════════════════════════════════════════════════════
+
+# ── 持仓模型（手动建仓，命令行传入）────────────────────────
+@dataclass
+class HeldShort:
+    """记录用户手动建立的空头持仓，用于在监控仪表盘中输出平仓建议。"""
+    entry_price:  float          # 建仓成本价（HKD）
+    qty:          int            # 持仓股数
+    stop_pct:     float = 0.035  # 止损：入场价 +3.5%
+    target1_pct:  float = 0.015  # 第一目标：入场价 -1.5%（建议减仓 50%）
+    target2_pct:  float = 0.030  # 第二目标：入场价 -3.0%（建议全部平仓）
+    target1_done: bool  = False  # 第一目标是否已触发
+
+    @property
+    def stop(self) -> float:
+        return round(self.entry_price * (1 + self.stop_pct), 1)
+
+    @property
+    def target1(self) -> float:
+        return round(self.entry_price * (1 - self.target1_pct), 1)
+
+    @property
+    def target2(self) -> float:
+        return round(self.entry_price * (1 - self.target2_pct), 1)
+
+    def unrealized_pnl(self, price: float) -> float:
+        return (self.entry_price - price) * self.qty
+
+    def pnl_pct(self, price: float) -> float:
+        return (self.entry_price - price) / self.entry_price * 100
+
+
+# ── 平仓建议评估（持仓模式专用）────────────────────────────
+@dataclass
+class CoverAdvice:
+    action:   str          # COVER_ALL / COVER_HALF / HOLD / STOP_LOSS
+    urgency:  int          # 0-100
+    reasons:  list[str]
+    pnl:      float        # 当前浮动盈亏（HKD）
+    pnl_pct:  float        # 盈亏百分比
+
+
+def evaluate_cover_signal(
+    held:          HeldShort,
+    price:         float,
+    squeeze_score: int,
+    imbalance:     float,
+    conn:          sqlite3.Connection,
+) -> CoverAdvice:
+    """
+    对手动持仓输出平仓建议，综合五个维度：
+
+    优先级（高→低）：
+      P1  价格触及止损线              → STOP_LOSS  立即全平
+      P2  逼空评分 ≥ 35 且有浮盈      → COVER_ALL  立即全平（趁还有利润）
+      P3  信号双反转（大单+失衡）     → COVER_ALL  全平
+      P4  信号单反转 或 逼空 25-35   → COVER_HALF 减仓 50%
+      P5  价格 ≤ 第二目标价           → COVER_ALL  锁利全平
+      P6  价格 ≤ 第一目标价           → COVER_HALF 减仓 50%
+      --  以上均未触发               → HOLD
+    """
+    pnl     = held.unrealized_pnl(price)
+    pnl_pct = held.pnl_pct(price)
+    reasons: list[str] = []
+    urgency = 0
+    action  = "HOLD"
+
+    # ── P1：止损 ──────────────────────────────────────────────
+    if price >= held.stop:
+        gap = (price - held.entry_price) / held.entry_price * 100
+        reasons.append(
+            f"价格({price}) ≥ 止损线({held.stop})，亏损 {abs(pnl_pct):.2f}%，立即止损"
+        )
+        return CoverAdvice("STOP_LOSS", 100, reasons, pnl, pnl_pct)
+
+    # ── P2：逼空高分 + 有浮盈 → 立即全平 ─────────────────────
+    if squeeze_score >= 35 and pnl > 0:
+        urgency = min(60 + (squeeze_score - 35) * 2, 95)
+        reasons.append(
+            f"逼空评分={squeeze_score}≥35 且浮盈={pnl:+,.0f} HKD，"
+            f"建议立即锁定利润全平"
+        )
+        action = "COVER_ALL"
+
+    # ── P3/P4：信号反转检测 ───────────────────────────────────
+    reversal_signals = []
+
+    # 大单净流入是否转正
+    big_nets = db_get_recent_big_net(conn, 4)
+    if len(big_nets) >= 3:
+        recent    = big_nets[:2]
+        had_neg   = any(v < 0 for v in big_nets[2:])
+        if all(v > 0 for v in recent) and had_neg:
+            avg = statistics.mean(recent)
+            reversal_signals.append(
+                f"大单净流入反转为正 {avg/10000:+,.1f}万（托盘迹象）"
+            )
+
+    # 失衡度是否连续高位
+    imb_rows = conn.execute(
+        "SELECT imbalance FROM orderbook_snapshots ORDER BY id DESC LIMIT 3"
+    ).fetchall()
+    if len(imb_rows) >= 2:
+        recent_imb = [r[0] for r in imb_rows[:2]]
+        if all(v > 0.70 for v in recent_imb):
+            reversal_signals.append(
+                f"失衡度持续高位 {statistics.mean(recent_imb):+.3f}（买方接管）"
+            )
+
+    if len(reversal_signals) >= 2:
+        urgency = max(urgency, 80)
+        reasons += reversal_signals
+        reasons.append("双信号反转，建议全部平仓")
+        action = "COVER_ALL"
+    elif len(reversal_signals) == 1 and action == "HOLD":
+        urgency = max(urgency, 45)
+        reasons += reversal_signals
+        reasons.append("单信号反转，建议减仓 50%")
+        action = "COVER_HALF"
+
+    # ── P4b：逼空中等风险（25-35）+ 有浮盈 → 减仓 ────────────
+    if 25 <= squeeze_score < 35 and pnl > 0 and action == "HOLD":
+        urgency = max(urgency, 40)
+        reasons.append(
+            f"逼空评分={squeeze_score}（预警区间），有浮盈，建议减仓 50% 锁利"
+        )
+        action = "COVER_HALF"
+
+    # ── P5：第二目标价 ────────────────────────────────────────
+    if price <= held.target2:
+        urgency = max(urgency, 75)
+        reasons.append(
+            f"价格({price}) ≤ 第二目标({held.target2})，盈利 {pnl_pct:.2f}%，全部平仓锁利"
+        )
+        action = "COVER_ALL"
+
+    # ── P6：第一目标价（仅未减仓时触发）─────────────────────
+    elif price <= held.target1 and not held.target1_done:
+        urgency = max(urgency, 55)
+        reasons.append(
+            f"价格({price}) ≤ 第一目标({held.target1})，盈利 {pnl_pct:.2f}%，建议减仓 50%"
+        )
+        if action == "HOLD":
+            action = "COVER_HALF"
+
+    # ── 无信号：持仓安全，显示持仓状态 ──────────────────────
+    if not reasons:
+        gap_to_t1 = price - held.target1
+        gap_to_stop = held.stop - price
+        reasons.append(
+            f"持仓安全 | 距目标①还差 {gap_to_t1:.1f} HKD | "
+            f"距止损还有 {gap_to_stop:.1f} HKD"
+        )
+
+    return CoverAdvice(action, urgency, reasons, pnl, pnl_pct)
+
+
 @dataclass
 class MonitorState:
     last_hkex_date:    Optional[str]   = None
@@ -933,6 +1089,8 @@ def print_dashboard(
     short_sigs:     list[str],
     exit_urgency:   int,
     exit_reasons:   list[str],
+    cover_advice:   Optional["CoverAdvice"] = None,
+    held:           Optional["HeldShort"]   = None,
 ):
     def bar(v: int) -> str:
         n = min(v // 5, 20)
@@ -997,17 +1155,58 @@ def print_dashboard(
         for r in exit_reasons:
             print(f"║   !! {r[:51]:<51}  ║")
 
+    # ── 手动持仓面板（--held-short 模式）────────────────────
+    if cover_advice is not None and held is not None and state.last_price is not None:
+        price = state.last_price
+
+        action_label = {
+            "COVER_ALL":  "!! 建议立即全部平仓 !!",
+            "COVER_HALF": "!  建议减仓 50%     !",
+            "STOP_LOSS":  "!! 触及止损，立即平仓!!",
+            "HOLD":       "   持仓安全，继续观望 ",
+        }.get(cover_advice.action, "─────────────────────")
+
+        pnl_arrow = "▲" if cover_advice.pnl >= 0 else "▼"
+        cost_gap  = held.stop - price
+
+        def bar(v: int, w: int = 20) -> str:
+            n = min(int(v / 100 * w), w)
+            return "█" * n + "░" * (w - n)
+
+        print(f"""╠══════════════════════════════════════════════════════════╣
+║  【手动持仓平仓建议】成本 {held.entry_price:.1f} × {held.qty:,} 股              ║
+╠══════════════════════════════════════════════════════════╣
+║  浮动盈亏  : {pnl_arrow} {abs(cover_advice.pnl):>10,.0f} HKD  ({cover_advice.pnl_pct:+.2f}%)           ║
+║  目标①    : {held.target1:<8.1f}  (-{held.target1_pct*100:.1f}%)  {"✓已触发" if held.target1_done else "○未触发"}              ║
+║  目标②    : {held.target2:<8.1f}  (-{held.target2_pct*100:.1f}%)                         ║
+║  止损线    : {held.stop:<8.1f}  (+{held.stop_pct*100:.1f}%)  距当前 {cost_gap:.1f} HKD           ║
+╠══════════════════════════════════════════════════════════╣
+║  平仓紧迫度 [{bar(cover_advice.urgency)}] {cover_advice.urgency:3d}/100      ║
+║  {action_label:<52}  ║""")
+        for r in cover_advice.reasons:
+            prefix = "!!" if cover_advice.action in ("COVER_ALL", "STOP_LOSS") else " →"
+            print(f"║ {prefix} {r[:54]:<54} ║")
+
     print("╚══════════════════════════════════════════════════════════╝")
 
 
 # ═══════════════════════════════════════════════════════════
 # 九、主监控循环
 # ═══════════════════════════════════════════════════════════
-def run_monitor():
-    log.info(f"启动监控: {SYMBOL}，实时轮询 {REALTIME_INTERVAL}s")
+def run_monitor(held_short: Optional[HeldShort] = None):
+    if held_short:
+        log.info(
+            f"启动监控（持仓模式）: {SYMBOL} | "
+            f"成本={held_short.entry_price} 数量={held_short.qty}股 | "
+            f"止损={held_short.stop} 目标①={held_short.target1} ②={held_short.target2}"
+        )
+    else:
+        log.info(f"启动监控: {SYMBOL}，实时轮询 {REALTIME_INTERVAL}s")
     log.info("提示：启动后输入 'p' 回车可切换持仓状态（标记是否持有空仓）")
     conn  = init_db(DB_PATH)
     state = MonitorState()
+    if held_short:
+        state.in_position = True     # 自动标记持仓
     ctx   = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
 
     ret, err = ctx.subscribe([SYMBOL], [SubType.QUOTE, SubType.ORDER_BOOK])
@@ -1084,11 +1283,33 @@ def run_monitor():
                 )
                 state.exit_urgency = exit_urgency
 
+            # ── 手动持仓平仓建议（--held-short 模式）─────────────
+            cover_advice = None
+            if held_short is not None and state.last_price is not None:
+                cover_advice = evaluate_cover_signal(
+                    held_short, state.last_price,
+                    squeeze_score, state.latest_imbalance or 0,
+                    conn,
+                )
+                # 触发了减仓建议时记录信号
+                if cover_advice.action in ("COVER_ALL", "STOP_LOSS"):
+                    db_save_signal(
+                        conn, f"COVER_{cover_advice.action}",
+                        cover_advice.reasons[0], cover_advice.urgency,
+                    )
+                elif cover_advice.action == "COVER_HALF" and not held_short.target1_done:
+                    db_save_signal(
+                        conn, "COVER_HALF",
+                        cover_advice.reasons[0], cover_advice.urgency,
+                    )
+
             # ── 打印仪表盘 ────────────────────────────────────────
             print_dashboard(
                 state, squeeze_score, squeeze_signals,
                 short_score, short_signal, short_sigs,
                 exit_urgency, exit_reasons,
+                cover_advice=cover_advice,
+                held=held_short,
             )
             log.info(
                 f"逼空={squeeze_score} | 做空={short_score}({short_signal}) | "
@@ -1161,21 +1382,55 @@ def cmd_backfill(days: int = 10):
 # 入口
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "monitor"
+    import argparse as _ap
 
-    if cmd == "monitor":
-        run_monitor()
-    elif cmd == "signals":
-        cmd_signals()
-    elif cmd == "export":
-        cmd_export()
-    elif cmd == "backfill":
-        cmd_backfill()
-    else:
-        print(
-            "用法:\n"
-            "  python short_squeeze_monitor.py             # 启动监控\n"
-            "  python short_squeeze_monitor.py backfill    # 补抓历史 HKEX 数据\n"
-            "  python short_squeeze_monitor.py signals     # 查看近期信号\n"
-            "  python short_squeeze_monitor.py export      # 导出数据 CSV\n"
+    _p = _ap.ArgumentParser(
+        description="MINIMAX-W 做空监控系统",
+        formatter_class=_ap.RawDescriptionHelpFormatter,
+        epilog="""
+子命令：
+  (无)       启动实时监控
+  backfill   补抓历史 HKEX 卖空数据
+  signals    查看近期触发信号
+  export     导出数据 CSV
+
+持仓模式（监控的同时提供平仓建议）：
+  python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000
+  python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000 --stop-pct 3.5 --t1-pct 1.5 --t2-pct 3.0
+"""
+    )
+    _p.add_argument("cmd", nargs="?", default="monitor",
+                    choices=["monitor", "backfill", "signals", "export"],
+                    help="子命令（默认 monitor）")
+    _p.add_argument("--held-short", type=float, default=0,
+                    metavar="PRICE", help="手动建仓成本价，启用持仓平仓建议面板")
+    _p.add_argument("--held-qty",   type=int,   default=1000,
+                    metavar="QTY",   help="持仓股数（默认 1000）")
+    _p.add_argument("--stop-pct",   type=float, default=3.5,
+                    metavar="PCT",   help="止损百分比，默认 3.5（%%）")
+    _p.add_argument("--t1-pct",     type=float, default=1.5,
+                    metavar="PCT",   help="第一目标利润百分比，默认 1.5（%%）")
+    _p.add_argument("--t2-pct",     type=float, default=3.0,
+                    metavar="PCT",   help="第二目标利润百分比，默认 3.0（%%）")
+
+    _args = _p.parse_args()
+
+    # 构建持仓对象
+    _held = None
+    if _args.held_short > 0:
+        _held = HeldShort(
+            entry_price  = _args.held_short,
+            qty          = _args.held_qty,
+            stop_pct     = _args.stop_pct   / 100,
+            target1_pct  = _args.t1_pct     / 100,
+            target2_pct  = _args.t2_pct     / 100,
         )
+
+    if _args.cmd == "monitor":
+        run_monitor(held_short=_held)
+    elif _args.cmd == "signals":
+        cmd_signals()
+    elif _args.cmd == "export":
+        cmd_export()
+    elif _args.cmd == "backfill":
+        cmd_backfill()

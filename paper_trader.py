@@ -15,11 +15,13 @@ MINIMAX-W (HK.00100) 模拟账户自动做空交易机器人
     · 评分 65–74 → 开仓 50%（HALF_QTY = 500 股）
     · 评分 ≥ 75  → 开仓 100%（FULL_QTY = 1000 股）
 
-平仓规则：
-    · 第一目标价 → 平仓 50%，更新止损至入场价
-    · 第二目标价 → 全部平仓，锁定利润
-    · 超过止损价 → 立即全部平仓，限制亏损
-    · 逼空评分 ≥ 35 → 紧急平仓，防止逼空
+平仓规则（优先级从高到低）：
+    · 超过止损价          → 立即全部平仓（动态：入场价 × 1.04）
+    · 逼空评分 ≥ 35       → 紧急全部平仓
+    · 信号反转（双信号）  → 全部平仓（大单转正 + 失衡度高位同时触发）
+    · 信号反转（单信号）  → 平仓 50%，止损上移至入场价
+    · 第二目标价          → 全部平仓（动态：入场价 × 0.97）
+    · 第一目标价          → 平仓 50%，止损上移至入场价（动态：入场价 × 0.985）
 
 依赖：
     pip install futu-api
@@ -80,12 +82,19 @@ ENTRY_CONFIRM_ROUNDS = 2             # 连续 ENTRY 信号轮数
 # ── 仓位管理 ──────────────────────────────────────────────
 FULL_QTY   = 1000                     # 满仓股数
 HALF_QTY   = 500                      # 半仓股数
-DEFAULT_STOP    = 950.0
-DEFAULT_TARGET1 = 870.0
-DEFAULT_TARGET2 = 850.0
+
+# ── 动态目标价（基于入场价百分比，可被命令行覆盖）──────────
+TARGET1_PCT = 0.015                   # 第一目标：入场价 -1.5%
+TARGET2_PCT = 0.030                   # 第二目标：入场价 -3.0%
+STOP_PCT    = 0.040                   # 止损：入场价 +4.0%
 
 # ── 平仓触发 ──────────────────────────────────────────────
 EMERGENCY_SQUEEZE = 35               # 逼空评分超此值 → 紧急平仓
+
+# ── 信号反转平仓阈值 ──────────────────────────────────────
+REVERSAL_BIG_NET_ROUNDS = 2          # 大单净流入连续转正 N 轮 → 反转信号
+REVERSAL_IMB_THRESHOLD  = 0.75       # 失衡度超过此值视为买方强势接管
+REVERSAL_IMB_ROUNDS     = 2          # 连续 N 轮高失衡 → 反转信号
 
 # ── 信号引擎参数（与 short_squeeze_monitor.py 保持一致）──
 SHORT_SAFE_SQUEEZE   = 25
@@ -158,7 +167,9 @@ class BotState:
     last_squeeze:    int = 0
     last_imbalance:  float = 0.0
     ask_history:     list[float] = field(default_factory=list)
+    imb_history:     list[float] = field(default_factory=list)   # 失衡度滚动历史
     target1_done:    bool = False         # 第一目标价是否已平仓
+    reversal_partial_done: bool = False   # 反转信号单次减仓是否已执行
 
 
 # ═══════════════════════════════════════════════════════════
@@ -170,7 +181,7 @@ def init_trade_db(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS paper_trades (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT,
-            action      TEXT,   -- SHORT_OPEN / COVER_PARTIAL / COVER_FULL / COVER_STOP / COVER_SQUEEZE
+            action      TEXT,   -- SHORT_OPEN / COVER_PARTIAL / COVER_FULL / COVER_STOP / COVER_SQUEEZE / COVER_REVERSAL
             price       REAL,
             qty         INTEGER,
             pnl         REAL,   -- 本次成交盈亏（平仓时）
@@ -626,20 +637,89 @@ def print_dashboard(bot: BotState, price: Optional[float],
 
 
 # ═══════════════════════════════════════════════════════════
+# 八b、信号反转检测
+# ═══════════════════════════════════════════════════════════
+def detect_reversal_signal(
+    conn: sqlite3.Connection,
+    bot: BotState,
+    imbalance: float,
+) -> tuple[bool, bool, list[str]]:
+    """
+    检测做空信号是否反转（仅持仓时调用）。
+
+    双信号同时触发 → full_exit=True（建议全部平仓）
+    单信号触发     → partial_exit=True（建议平仓 50%）
+    无信号         → (False, False, [])
+
+    信号A：大单净流入由负转正（主力开始托盘）
+        - 最近 REVERSAL_BIG_NET_ROUNDS 轮全部为正
+        - 且此前存在负值（证明方向真实反转）
+
+    信号B：失衡度持续高位（买方强势接管）
+        - 最近 REVERSAL_IMB_ROUNDS 轮失衡度均 > REVERSAL_IMB_THRESHOLD
+        - 均值越高越强烈
+    """
+    # 追踪失衡度滚动历史
+    bot.imb_history.append(imbalance)
+    if len(bot.imb_history) > 10:
+        bot.imb_history = bot.imb_history[-10:]
+
+    triggered = []
+    reasons   = []
+
+    # ── 信号A：大单净流入反转 ─────────────────────────────
+    big_nets = db_get_recent_big_net(conn, REVERSAL_BIG_NET_ROUNDS + 3)
+    if len(big_nets) >= REVERSAL_BIG_NET_ROUNDS + 1:
+        recent    = big_nets[:REVERSAL_BIG_NET_ROUNDS]
+        earlier   = big_nets[REVERSAL_BIG_NET_ROUNDS:]
+        had_neg   = any(v < 0 for v in earlier)
+        if all(v > 0 for v in recent) and had_neg:
+            avg_net = statistics.mean(recent)
+            triggered.append("A")
+            reasons.append(
+                f"大单净流入反转：连续{REVERSAL_BIG_NET_ROUNDS}轮正值 "
+                f"均值={avg_net/10000:+,.1f}万"
+            )
+            log.warning(f"[反转-A] {reasons[-1]}")
+
+    # ── 信号B：失衡度持续高位 ─────────────────────────────
+    if len(bot.imb_history) >= REVERSAL_IMB_ROUNDS:
+        recent_imb = bot.imb_history[-REVERSAL_IMB_ROUNDS:]
+        if all(v > REVERSAL_IMB_THRESHOLD for v in recent_imb):
+            avg_imb = statistics.mean(recent_imb)
+            triggered.append("B")
+            reasons.append(
+                f"失衡度持续高位：连续{REVERSAL_IMB_ROUNDS}轮 "
+                f"均值={avg_imb:+.3f}（买方强势接管）"
+            )
+            log.warning(f"[反转-B] {reasons[-1]}")
+
+    full_exit    = len(triggered) >= 2          # 双信号 → 全平
+    partial_exit = len(triggered) == 1          # 单信号 → 减仓
+    return full_exit, partial_exit, reasons
+
+
+# ═══════════════════════════════════════════════════════════
 # 九、主交易循环
 # ═══════════════════════════════════════════════════════════
+def _calc_targets(entry: float, args) -> tuple[float, float, float]:
+    """
+    计算动态目标价和止损价。
+    命令行传入非零值时优先使用，否则按入场价百分比动态计算。
+    """
+    stop    = args.stop    if args.stop    > 0 else round(entry * (1 + STOP_PCT),    1)
+    target1 = args.target1 if args.target1 > 0 else round(entry * (1 - TARGET1_PCT), 1)
+    target2 = args.target2 if args.target2 > 0 else round(entry * (1 - TARGET2_PCT), 1)
+    return stop, target1, target2
+
+
 def run(args):
     dry_run = args.dry_run
     max_qty = args.qty
-    stop_price  = args.stop
-    target1     = args.target1
-    target2     = args.target2
 
     log.info(
-        f"模拟交易启动 | "
-        f"acc_id={SIM_ACC_ID} env={SIM_ENV} "
-        f"最大仓位={max_qty}股 止损={stop_price} "
-        f"目标①={target1} ②={target2} "
+        f"模拟交易启动 | acc_id={SIM_ACC_ID} env={SIM_ENV} "
+        f"最大仓位={max_qty}股 | 目标价模式={'固定' if args.target1 > 0 else '动态'} "
         f"dry_run={dry_run}"
     )
 
@@ -717,27 +797,32 @@ def run(args):
 
                         ok = place_short_order(trade_ctx, price, qty, dry_run)
                         if ok:
+                            # 动态计算目标价和止损
+                            dyn_stop, dyn_t1, dyn_t2 = _calc_targets(price, args)
                             bot.position = Position(
                                 entry_price = price,
                                 qty         = qty,
                                 entry_time  = datetime.datetime.now().isoformat("seconds"),
-                                stop_price  = stop_price,
-                                target1     = target1,
-                                target2     = target2,
+                                stop_price  = dyn_stop,
+                                target1     = dyn_t1,
+                                target2     = dyn_t2,
                             )
-                            bot.trader_state   = TraderState.IN_POSITION
-                            bot.confirm_rounds = 0
+                            bot.trader_state        = TraderState.IN_POSITION
+                            bot.confirm_rounds      = 0
+                            bot.reversal_partial_done = False
+                            bot.imb_history.clear()
                             log.warning(
                                 f"[入场] 做空 {qty}股 @ {price} | "
-                                f"入场评分={entry_score} 仓位={'半仓' if qty == HALF_QTY else '满仓'}"
+                                f"评分={entry_score} 仓位={'半仓' if qty == HALF_QTY else '满仓'} | "
+                                f"止损={dyn_stop} 目标①={dyn_t1} ②={dyn_t2}"
                             )
                             log_trade(
                                 conn, "SHORT_OPEN", price, qty, 0.0, 0.0,
                                 entry_score, squeeze_score, imbalance,
-                                f"仓位={'半仓' if qty == HALF_QTY else '满仓'} score={entry_score}"
+                                f"仓位={'半仓' if qty == HALF_QTY else '满仓'} "
+                                f"stop={dyn_stop} t1={dyn_t1} t2={dyn_t2}"
                             )
                         else:
-                            # 下单失败，重置确认计数
                             bot.confirm_rounds = 0
                 else:
                     # 信号中断，重置计数
@@ -797,66 +882,116 @@ def run(args):
                         bot.trader_state = TraderState.IDLE
                         bot.target1_done = False
 
-                # C：第二目标价 → 全部平仓
-                elif price <= pos.target2 and pos.open_qty > 0:
-                    log.info(
-                        f"[目标②] 价格 {price} ≤ {pos.target2}，"
-                        f"全部平仓 {pos.open_qty}股"
+                # C：信号反转平仓（双信号全平，单信号减仓）
+                else:
+                    full_rev, partial_rev, rev_reasons = detect_reversal_signal(
+                        conn, bot, imbalance
                     )
-                    ok = place_cover_order(
-                        trade_ctx, price, pos.open_qty, dry_run
-                    )
-                    if ok:
-                        pnl = pos.unrealized_pnl(price)
-                        pos.realized_pnl += pnl
-                        pos.covered_qty   = pos.qty
-                        log_trade(
-                            conn, "COVER_FULL", price, pos.open_qty,
-                            pnl, pos.realized_pnl,
-                            bot.last_entry_score, squeeze_score, imbalance,
-                            f"第二目标价 {pos.target2}"
+                    if full_rev and pos.open_qty > 0:
+                        log.warning(
+                            f"[反转全平] 双信号触发，全部平仓 {pos.open_qty}股 | "
+                            + " / ".join(rev_reasons)
                         )
-                        bot.position     = None
-                        bot.trader_state = TraderState.IDLE
-                        bot.target1_done = False
-
-                # D：第一目标价 → 平仓 50%
-                elif (price <= pos.target1
-                      and not bot.target1_done
-                      and bot.trader_state == TraderState.IN_POSITION):
-                    half = pos.open_qty // 2
-                    if half > 0:
-                        log.info(
-                            f"[目标①] 价格 {price} ≤ {pos.target1}，"
-                            f"平仓 50% ({half}股)"
-                        )
-                        ok = place_cover_order(trade_ctx, price, half, dry_run)
+                        ok = place_cover_order(trade_ctx, price, pos.open_qty, dry_run)
                         if ok:
-                            pnl = (pos.entry_price - price) * half
+                            pnl = pos.unrealized_pnl(price)
                             pos.realized_pnl += pnl
-                            pos.covered_qty  += half
-                            # 止损上移至入场价（锁定利润）
-                            pos.stop_price    = pos.entry_price
-                            bot.target1_done  = True
-                            bot.trader_state  = TraderState.COVERING
+                            pos.covered_qty   = pos.qty
                             log_trade(
-                                conn, "COVER_PARTIAL", price, half,
+                                conn, "COVER_REVERSAL", price, pos.open_qty,
                                 pnl, pos.realized_pnl,
                                 bot.last_entry_score, squeeze_score, imbalance,
-                                f"第一目标价 {pos.target1}，止损移至 {pos.entry_price}"
+                                "双信号反转全平: " + "; ".join(rev_reasons)
                             )
-                            log.info(
-                                f"剩余仓位 {pos.open_qty}股，"
-                                f"止损已上移至入场价 {pos.entry_price}"
-                            )
+                            bot.position              = None
+                            bot.trader_state          = TraderState.IDLE
+                            bot.target1_done          = False
+                            bot.reversal_partial_done = False
 
-                else:
-                    # 持仓观望
-                    pnl = pos.unrealized_pnl(price)
-                    log.info(
-                        f"[持仓] 价格={price} 盈亏={pnl:+,.0f} | "
-                        f"逼空={squeeze_score} 入场评分={entry_score}"
-                    )
+                    elif partial_rev and not bot.reversal_partial_done and pos.open_qty > 0:
+                        half = pos.open_qty // 2
+                        if half > 0:
+                            log.warning(
+                                f"[反转减仓] 单信号触发，平仓50% ({half}股) | "
+                                + rev_reasons[0]
+                            )
+                            ok = place_cover_order(trade_ctx, price, half, dry_run)
+                            if ok:
+                                pnl = (pos.entry_price - price) * half
+                                pos.realized_pnl         += pnl
+                                pos.covered_qty          += half
+                                pos.stop_price            = pos.entry_price  # 止损上移至入场价
+                                bot.reversal_partial_done = True
+                                bot.trader_state          = TraderState.COVERING
+                                log_trade(
+                                    conn, "COVER_REVERSAL", price, half,
+                                    pnl, pos.realized_pnl,
+                                    bot.last_entry_score, squeeze_score, imbalance,
+                                    "单信号反转减仓50%: " + rev_reasons[0]
+                                )
+                                log.info(f"止损上移至入场价 {pos.entry_price}")
+
+                # D/E：目标价检查（仅当反转逻辑未触发全平时才执行）
+                if bot.position is not None:
+                    pos = bot.position  # 刷新引用（反转逻辑可能修改过 open_qty）
+
+                    # E：第二目标价 → 全部平仓
+                    if price <= pos.target2 and pos.open_qty > 0:
+                        log.info(
+                            f"[目标②] 价格 {price} ≤ {pos.target2}，"
+                            f"全部平仓 {pos.open_qty}股"
+                        )
+                        ok = place_cover_order(trade_ctx, price, pos.open_qty, dry_run)
+                        if ok:
+                            pnl = pos.unrealized_pnl(price)
+                            pos.realized_pnl += pnl
+                            pos.covered_qty   = pos.qty
+                            log_trade(
+                                conn, "COVER_FULL", price, pos.open_qty,
+                                pnl, pos.realized_pnl,
+                                bot.last_entry_score, squeeze_score, imbalance,
+                                f"第二目标价 {pos.target2}"
+                            )
+                            bot.position     = None
+                            bot.trader_state = TraderState.IDLE
+                            bot.target1_done = False
+
+                    # F：第一目标价 → 平仓 50%
+                    elif (price <= pos.target1
+                          and not bot.target1_done
+                          and bot.trader_state == TraderState.IN_POSITION):
+                        half = pos.open_qty // 2
+                        if half > 0:
+                            log.info(
+                                f"[目标①] 价格 {price} ≤ {pos.target1}，"
+                                f"平仓 50% ({half}股)"
+                            )
+                            ok = place_cover_order(trade_ctx, price, half, dry_run)
+                            if ok:
+                                pnl = (pos.entry_price - price) * half
+                                pos.realized_pnl += pnl
+                                pos.covered_qty  += half
+                                pos.stop_price    = pos.entry_price
+                                bot.target1_done  = True
+                                bot.trader_state  = TraderState.COVERING
+                                log_trade(
+                                    conn, "COVER_PARTIAL", price, half,
+                                    pnl, pos.realized_pnl,
+                                    bot.last_entry_score, squeeze_score, imbalance,
+                                    f"第一目标价 {pos.target1}，止损移至 {pos.entry_price}"
+                                )
+                                log.info(
+                                    f"剩余仓位 {pos.open_qty}股，"
+                                    f"止损已上移至入场价 {pos.entry_price}"
+                                )
+
+                    else:
+                        # 持仓观望
+                        pnl = pos.unrealized_pnl(price)
+                        log.info(
+                            f"[持仓] 价格={price} 盈亏={pnl:+,.0f} | "
+                            f"逼空={squeeze_score} 入场评分={entry_score}"
+                        )
 
             time.sleep(POLL_INTERVAL)
 
@@ -873,18 +1008,35 @@ def run(args):
 # 十、入口
 # ═══════════════════════════════════════════════════════════
 def parse_args():
-    p = argparse.ArgumentParser(description="MINIMAX-W 模拟自动做空机器人")
-    p.add_argument("--qty",     type=int,   default=FULL_QTY,
+    p = argparse.ArgumentParser(
+        description="MINIMAX-W 模拟自动做空机器人",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+目标价模式：
+  默认（不传参）→ 动态计算（基于入场价百分比）
+    止损   = 入场价 × {1 + STOP_PCT:.3f}  (+{STOP_PCT*100:.1f}%)
+    目标①  = 入场价 × {1 - TARGET1_PCT:.3f}  (-{TARGET1_PCT*100:.1f}%)
+    目标②  = 入场价 × {1 - TARGET2_PCT:.3f}  (-{TARGET2_PCT*100:.1f}%)
+
+  手动指定（传入非零值）→ 覆盖动态计算，固定价位执行
+
+示例：
+  python3 paper_trader.py                          # 动态目标价
+  python3 paper_trader.py --stop 920 --target2 840 # 固定止损/目标②，目标①仍动态
+  python3 paper_trader.py --dry-run                # 只打印信号，不实际下单
+"""
+    )
+    p.add_argument("--qty",      type=int,   default=FULL_QTY,
                    help=f"最大仓位股数，默认 {FULL_QTY}")
-    p.add_argument("--stop",    type=float, default=DEFAULT_STOP,
-                   help=f"止损价，默认 {DEFAULT_STOP}")
-    p.add_argument("--target1", type=float, default=DEFAULT_TARGET1,
-                   help=f"第一目标价，默认 {DEFAULT_TARGET1}")
-    p.add_argument("--target2", type=float, default=DEFAULT_TARGET2,
-                   help=f"第二目标价，默认 {DEFAULT_TARGET2}")
-    p.add_argument("--interval", type=int,  default=POLL_INTERVAL,
+    p.add_argument("--stop",     type=float, default=0,
+                   help="固定止损价（0=动态，默认0）")
+    p.add_argument("--target1",  type=float, default=0,
+                   help="固定第一目标价（0=动态，默认0）")
+    p.add_argument("--target2",  type=float, default=0,
+                   help="固定第二目标价（0=动态，默认0）")
+    p.add_argument("--interval", type=int,   default=POLL_INTERVAL,
                    help=f"轮询间隔秒数，默认 {POLL_INTERVAL}")
-    p.add_argument("--dry-run", action="store_true",
+    p.add_argument("--dry-run",  action="store_true",
                    help="仅模拟信号输出，不实际下单")
     return p.parse_args()
 
