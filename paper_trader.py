@@ -9,7 +9,7 @@ MINIMAX-W (HK.00100) 模拟账户自动做空交易机器人
     1. 做空入场评分 ≥ 65（HIGH_ENTRY_SCORE）
     2. 连续 2 轮维持 ENTRY 信号（排除单轮噪声）
     3. 逼空评分 < 20（SAFE_SQUEEZE_SCORE）
-    4. 摆盘失衡度 < -0.50（ENTRY_IMB_THRESHOLD）
+    4. 摆盘失衡度 < +0.60（ENTRY_IMB_THRESHOLD）— 排除订单簿极度偏多的情况
 
 仓位管理：
     · 评分 65–74 → 开仓 50%（HALF_QTY = 500 股）
@@ -74,7 +74,7 @@ POLL_INTERVAL = 60                    # 轮询秒数
 # ── 入场条件 ──────────────────────────────────────────────
 HIGH_ENTRY_SCORE    = 65              # 最低入场评分
 SAFE_SQUEEZE_SCORE  = 20             # 最大允许逼空评分
-ENTRY_IMB_THRESHOLD = -0.50          # 失衡度必须低于此值（偏空）
+ENTRY_IMB_THRESHOLD = 0.60           # 失衡度低于此值才允许入场（排除极度偏多）
 ENTRY_CONFIRM_ROUNDS = 2             # 连续 ENTRY 信号轮数
 
 # ── 仓位管理 ──────────────────────────────────────────────
