@@ -74,12 +74,18 @@ SHORT_PRICE_WINDOW   = 10         # 价格历史窗口（轮次）
 # ═══════════════════════════════════════════════════════════
 # 二、日志
 # ═══════════════════════════════════════════════════════════
+import os as _os
+_LOG_DIR  = "logs"
+_LOG_DATE = datetime.date.today().strftime("%Y%m%d")
+_LOG_FILE = _os.path.join(_LOG_DIR, f"short_monitor_{_LOG_DATE}.log")
+_os.makedirs(_LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("short_monitor.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),                          # 与 print() 同流，nohup 重定向后顺序一致
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),           # 按日期独立日志文件
     ],
 )
 log = logging.getLogger(__name__)

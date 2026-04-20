@@ -74,9 +74,14 @@ SIM_ENV       = TrdEnv.SIMULATE
 SIM_MARKET    = TrdMarket.HK
 
 DB_PATH            = "short_data.db"       # 与 short_squeeze_monitor.py 共享
-TRADER_LOG         = "paper_trader.log"
 TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
 POLL_INTERVAL      = 60                    # 轮询秒数
+
+import os as _os
+_LOG_DIR   = "logs"
+_LOG_DATE  = datetime.date.today().strftime("%Y%m%d")
+TRADER_LOG = _os.path.join(_LOG_DIR, f"paper_trader_{_LOG_DATE}.log")
+_os.makedirs(_LOG_DIR, exist_ok=True)
 
 # ── 入场条件 ──────────────────────────────────────────────
 HIGH_ENTRY_SCORE    = 65              # 最低入场评分
@@ -125,8 +130,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(TRADER_LOG, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),                         # 与 print() 同流，nohup 重定向后顺序一致
+        logging.FileHandler(TRADER_LOG, encoding="utf-8"),         # 按日期独立日志文件
     ],
 )
 log = logging.getLogger(__name__)

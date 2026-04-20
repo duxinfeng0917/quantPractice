@@ -2446,3 +2446,259 @@ HKEX 动能支撑 → +15分
 
 更新了 `CONVERSATION_LOG.md`，追加本轮（2026-04-17）完整对话记录。
 
+---
+
+---
+
+# 对话续篇 — 2026-04-20（新 Context）
+
+> 本段记录为上一轮对话 Context 压缩后，新 Session 中继续的内容。
+
+---
+
+## Q1. 用户（2026-04-20）
+
+（分享 15:50-15:54 仪表盘日志）为什么 15:52 触发了 ENTRY CONFIRM 1/2，但又被中断？
+
+---
+
+### 助手回复
+
+**原因：信号在第 2 轮从 ENTRY 降级为 CAUTION**
+
+| 时间 | 评分 | 失衡度 | 状态 |
+|------|------|--------|------|
+| 15:52 | 67 (ENTRY) | -0.440 | CONFIRM 1/2 |
+| 15:53 | 59 (CAUTION) | -0.245 | 信号中断，重置→0 |
+
+评分从 67 降至 59 的原因：失衡度从 `-0.440` 回升至 `-0.245`，越过了摆盘偏空加分阈值（`< -0.30`），`+8` 分丢失，触发信号降级。
+
+**深层问题：临收盘时间窗口不足**
+
+15:52 距港股 16:00 收盘仅 8 分钟，状态机需要连续 2 轮 ENTRY 才能下单，在此时间段内完成确认并安全开仓意义不大（持仓过夜风险高）。
+
+**解决方案**：加入收盘时间保护（`CLOSE_GUARD_TIME = 15:50`），15:50 后不累积确认轮数。
+
+---
+
+## Q2. 用户
+
+加入收盘时间保护
+
+---
+
+### 助手回复
+
+在 `paper_trader.py` 中新增：
+
+**配置常量**：
+```python
+CLOSE_GUARD_TIME = datetime.time(15, 50)   # 此时间后禁止开新仓（HKT）
+```
+
+**状态机 IDLE 分支最前面**：
+```python
+if datetime.datetime.now().time() >= dyn_close_guard:
+    if bot.confirm_rounds > 0:
+        log.info("[收盘保护] 15:50 后禁止开仓，重置确认计数")
+        bot.confirm_rounds = 0
+    time.sleep(POLL_INTERVAL)
+    continue   # 跳过入场逻辑，持仓平仓逻辑不受影响
+```
+
+**仪表盘标题栏**：15:50 后显示 `[CLOSE-GUARD]` 替代 `[LIVE-SIM]`，状态行增加 `⚠ 收盘禁开仓` 提示。
+
+---
+
+## Q3. 用户
+
+读取日志，分析模拟账户今天（2026-04-17）一天未开仓是否存在 bug
+
+---
+
+### 助手回复
+
+**结论：存在 1 个真实 Bug + 1 个设计局限**
+
+**Bug（严重）：上午 09:25-11:11 运行旧代码**
+
+paper_trader 在 09:25 启动时用的是修改前的版本（`ENTRY_IMB_THRESHOLD = -0.50`），直到 11:11 手动重启才切换为新阈值 `0.60`。用新条件回放，上午有 7 个信号满足条件被旧代码全部拦截，其中 10:28 评分=80 是最强错失机会。
+
+**设计局限**：代码修改后必须手动重启才生效，实盘会错过开盘黄金窗口。
+
+**11:11 后（新代码）**：系统正常工作，无 bug。下午信号评分普遍低于 65，两次 CONFIRM 1/2（15:46、15:52）均因信号衰减被中断。
+
+---
+
+## Q4. 用户
+
+加入热更新配置功能（修改阈值无需重启）
+
+---
+
+### 助手回复
+
+**新增文件：`trader_config.json`**
+```json
+{
+  "HIGH_ENTRY_SCORE": 65,
+  "SAFE_SQUEEZE_SCORE": 20,
+  "ENTRY_IMB_THRESHOLD": 0.60,
+  "ENTRY_CONFIRM_ROUNDS": 2,
+  "EMERGENCY_SQUEEZE": 35,
+  "CLOSE_GUARD_TIME": "15:50",
+  "TARGET1_PCT": 0.015,
+  "TARGET2_PCT": 0.030,
+  "STOP_PCT": 0.040,
+  "REVERSAL_IMB_THRESHOLD": 0.75
+}
+```
+
+**`paper_trader.py` 改动**：
+- 新增 `load_config()` 函数，每轮从 JSON 文件读取参数，失败时静默使用模块级常量兜底
+- 主循环最前面读取 10 个动态变量（`dyn_high_entry`, `dyn_imb_threshold` 等）
+- 配置发生变化时打印一条 `[配置]` 日志（相同配置不重复打印）
+- 状态机全部替换为动态变量，包括 `EMERGENCY_SQUEEZE`、`REVERSAL_IMB_THRESHOLD`、`CLOSE_GUARD_TIME`
+
+**效果**：修改 `trader_config.json` 后，60 秒内自动生效，无需停机重启。
+
+---
+
+## Q5. 用户
+
+日志没有打印仪表盘（nohup 方式运行时 stdout/stderr 顺序混乱）
+
+---
+
+### 助手回复
+
+**原因**：`print()`（仪表盘）写 `sys.stdout`，`logging.StreamHandler()` 默认写 `sys.stderr`。两个独立流在终端显示时顺序不确定，nohup 重定向后更明显。
+
+**解决方案**：将两个脚本的 `StreamHandler` 改为 `sys.stdout`，与 `print()` 同流，确保顺序一致。同时将日志文件改为按日期命名并存入 `logs/` 目录。
+
+**`short_squeeze_monitor.py`**：
+```python
+_LOG_DIR  = "logs"
+_LOG_DATE = datetime.date.today().strftime("%Y%m%d")
+_LOG_FILE = os.path.join(_LOG_DIR, f"short_monitor_{_LOG_DATE}.log")
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+logging.basicConfig(handlers=[
+    logging.StreamHandler(sys.stdout),          # 改为 stdout
+    logging.FileHandler(_LOG_FILE, ...),        # 按日期命名
+])
+```
+
+同样修改 `paper_trader.py`（日志文件：`logs/paper_trader_{DATE}.log`）。
+
+---
+
+## Q6. 用户
+
+新增 `start.sh` 每日启动脚本
+
+---
+
+### 助手回复
+
+创建 `start.sh`，支持以下命令：
+
+```bash
+bash start.sh monitor              # 后台启动逼空监控器
+bash start.sh trader [参数]        # 后台启动模拟交易机器人
+bash start.sh all [trader参数]     # 同时启动 monitor + trader
+bash start.sh stop                 # 停止所有相关进程
+bash start.sh status               # 查看进程状态 + 今日日志文件列表
+bash start.sh log [monitor|trader] # 实时查看日志（tail -f）
+```
+
+关键特性：
+- 启动前检查进程是否已在运行，防止重复启动
+- 使用 `python3 -u`（unbuffered）确保 print 输出不延迟
+- stdout 重定向至 `logs/monitor_stdout_{DATE}.log`，内部日志写 `logs/short_monitor_{DATE}.log`
+- `all` 命令启动后自动打印 `status` 确认两个进程均已运行
+
+**每日日志结构**：
+```
+logs/
+├── monitor_stdout_20260420.log   ← 完整输出（仪表盘+日志，顺序一致）
+├── short_monitor_20260420.log    ← 结构化日志行（便于 grep 分析）
+├── trader_stdout_20260420.log    ← trader 完整输出
+└── paper_trader_20260420.log     ← trader 结构化日志（含交易记录）
+```
+
+---
+
+## Q7. 用户
+
+`--dry-run` 是什么意思？
+
+---
+
+### 助手回复
+
+**三个层级**：
+
+| 模式 | 资金 | 是否调用富途下单接口 | 模拟账户是否产生持仓 |
+|------|------|---------------------|----------------------|
+| 实盘账户（未来） | 真实资金 | ✓ | — |
+| 模拟账户（默认） | 虚拟资金 | ✓ `place_order()` | ✓ |
+| **dry-run** | 无 | ✗ 跳过 | ✗ |
+
+`--dry-run` 时信号评分、状态机、日志全部正常运行，只是遇到入场/平仓条件时只打印日志，不调用 `place_order()`。适合代码改动后验证逻辑是否正确，连模拟账户都不会产生订单。
+
+---
+
+## Q8. 用户
+
+如何从模拟账户切换到实盘账户？
+
+---
+
+### 助手回复
+
+**切换步骤**：
+
+1. 跑完整一天模拟，验证下单/平仓记录正常
+2. 查询真实账户 acc_id：
+```python
+from futu import OpenSecTradeContext, TrdMarket
+ctx = OpenSecTradeContext(filter_trdmarket=TrdMarket.HK, host="127.0.0.1", port=11111)
+ret, data = ctx.get_account_list()
+print(data[["acc_id", "trd_env", "acc_type", "trd_market_auth"]])
+ctx.close()
+```
+
+3. 修改 `paper_trader.py` 三行配置：
+```python
+SIM_ACC_ID = <真实 acc_id>
+SIM_ENV    = TrdEnv.REAL
+SIM_MARKET = TrdMarket.HK
+```
+
+4. 实盘第一天用小仓位试水：
+```bash
+bash start.sh trader --qty 100
+```
+
+5. 同时在 `trader_config.json` 调严阈值降低风险：
+```json
+{
+  "HIGH_ENTRY_SCORE": 75,
+  "ENTRY_CONFIRM_ROUNDS": 3,
+  "STOP_PCT": 0.025
+}
+```
+
+---
+
+## Q9. 用户
+
+更新对话记录
+
+---
+
+### 助手回复
+
+追加 2026-04-20 对话记录至 `CONVERSATION_LOG.md`，涵盖：收盘保护实现、日志流顺序修复、热更新配置、start.sh 启动脚本、dry-run 说明、模拟→实盘切换指南。
+
