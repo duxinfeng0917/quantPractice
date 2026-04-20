@@ -48,6 +48,24 @@ import argparse
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
+from pathlib import Path
+
+# 自动加载 .env 文件（若存在），不依赖第三方库
+def _load_dotenv(path: str = ".env"):
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        import os
+        os.environ.setdefault(key, val)   # 已有环境变量优先，不覆盖
+
+_load_dotenv()
 
 from futu import (
     OpenQuoteContext,
@@ -70,17 +88,17 @@ OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
 # ── 账户配置（切换实盘只需改这三行）────────────────────────
-# 模拟账户
-SIM_ACC_ID    = 18982257
-SIM_ENV       = TrdEnv.SIMULATE
-SIM_MARKET    = TrdMarket.HK
-SIM_FIRM      = None                          # 模拟账户无需指定券商
-
-# 实盘账户（切换时取消注释，注释掉上面四行）
-# SIM_ACC_ID = 281756478968301696
-# SIM_ENV    = TrdEnv.REAL
+# 模拟账户（OPTION类型，不支持港股做空，已停用）
+# SIM_ACC_ID = 18982257
+# SIM_ENV    = TrdEnv.SIMULATE
 # SIM_MARKET = TrdMarket.HK
-# SIM_FIRM   = SecurityFirm.FUTUSECURITIES
+# SIM_FIRM   = None
+
+# 实盘账户
+SIM_ACC_ID = 281756478968301696
+SIM_ENV    = TrdEnv.REAL
+SIM_MARKET = TrdMarket.HK
+SIM_FIRM   = SecurityFirm.FUTUSECURITIES
 
 DB_PATH            = "short_data.db"       # 与 short_squeeze_monitor.py 共享
 TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
@@ -464,9 +482,12 @@ def compute_entry_score(conn: sqlite3.Connection,
                          squeeze_score: int,
                          current_price: Optional[float],
                          current_ask: float,
-                         current_imbalance: float) -> tuple[int, str, list[str]]:
+                         current_imbalance: float,
+                         entry_threshold: int = HIGH_ENTRY_SCORE,
+                         safe_squeeze: int = SHORT_SAFE_SQUEEZE,
+                         ) -> tuple[int, str, list[str]]:
     """做空入场评分（0-100），含安全门。"""
-    if squeeze_score > SHORT_SAFE_SQUEEZE:
+    if squeeze_score > safe_squeeze:
         return 0, "BLOCKED", [
             f"逼空评分={squeeze_score} 超安全线 {SHORT_SAFE_SQUEEZE}，禁止开空"
         ]
@@ -545,7 +566,7 @@ def compute_entry_score(conn: sqlite3.Connection,
     score += hkex_sup
 
     score = min(score, 100)
-    if score >= HIGH_ENTRY_SCORE:
+    if score >= entry_threshold:
         sig_type = "ENTRY"
     elif score >= int(SHORT_ENTRY_MIN * 0.6):
         sig_type = "CAUTION"
@@ -560,11 +581,11 @@ def compute_entry_score(conn: sqlite3.Connection,
 # ═══════════════════════════════════════════════════════════
 def fetch_market_data(quote_ctx: OpenQuoteContext,
                       conn: sqlite3.Connection
-                      ) -> tuple[Optional[float], float, float, float]:
+                      ) -> tuple[Optional[float], float, float, float, Optional[float]]:
     """
-    拉取最新价、卖盘深度、买盘深度、失衡度。
+    拉取最新价、卖盘深度、买盘深度、失衡度、卖一价。
     同时写入 DB，供信号引擎使用。
-    返回 (price, ask_depth, bid_depth, imbalance)
+    返回 (price, ask_depth, bid_depth, imbalance, best_ask_price)
     """
     ts  = datetime.datetime.now().isoformat(timespec="seconds")
     price = None
@@ -577,12 +598,16 @@ def fetch_market_data(quote_ctx: OpenQuoteContext,
 
     # 摆盘
     ask_depth = bid_depth = imbalance = 0.0
+    best_ask_price = None
     ret, ob = quote_ctx.get_order_book(SYMBOL, num=10)
     if ret == RET_OK:
         bid_depth = sum(float(x[1]) for x in ob.get("Bid", []))
         ask_depth = sum(float(x[1]) for x in ob.get("Ask", []))
         total     = bid_depth + ask_depth
         imbalance = (bid_depth - ask_depth) / total if total > 0 else 0.0
+        asks = ob.get("Ask", [])
+        if asks:
+            best_ask_price = float(asks[0][0])   # 卖一价，港股卖空订单价格须 ≥ 此值
         db_save_orderbook(conn, ts, bid_depth, ask_depth, imbalance)
 
     # 资金流向
@@ -598,7 +623,7 @@ def fetch_market_data(quote_ctx: OpenQuoteContext,
         db_save_capital(conn, ts, big_in, big_out,
                         big_in - big_out, mid_net, sml_net)
 
-    return price, ask_depth, bid_depth, imbalance
+    return price, ask_depth, bid_depth, imbalance, best_ask_price
 
 
 # ═══════════════════════════════════════════════════════════
@@ -660,7 +685,8 @@ def place_cover_order(trade_ctx: OpenSecTradeContext,
 def print_dashboard(bot: BotState, price: Optional[float],
                     squeeze: int, entry: int,
                     sig_type: str, imbalance: float,
-                    signals: list[str], dry_run: bool):
+                    signals: list[str], dry_run: bool,
+                    confirm_total: int = ENTRY_CONFIRM_ROUNDS):
     now = datetime.datetime.now().strftime("%H:%M:%S")
     state_str = bot.trader_state.name
     pos = bot.position
@@ -680,7 +706,7 @@ def print_dashboard(bot: BotState, price: Optional[float],
     print(f"\n╔══════════════════════════════════════════════════════════╗")
     print(f"║  MINIMAX-W 模拟自动交易  {now}{mode_tag:<16}  ║")
     print(f"╠══════════════════════════════════════════════════════════╣")
-    confirm_str = f"确认轮: {bot.confirm_rounds}/{ENTRY_CONFIRM_ROUNDS}"
+    confirm_str = f"确认轮: {bot.confirm_rounds}/{confirm_total}"
     guard_str   = "  ⚠ 收盘禁开仓" if close_guard else ""
     print(f"║  状态：{state_str:<12}  {confirm_str}{guard_str:<14}║")
     if price:
@@ -820,6 +846,23 @@ def run(args):
         security_firm = SIM_FIRM,
     )
 
+    # 实盘尝试 API 解锁（GUI 版 OpenD 已在界面手动解锁，API 调用会被拒绝但可忽略）
+    if SIM_ENV == TrdEnv.REAL:
+        trade_pwd = args.trade_pwd or _os.environ.get("FUTU_TRADE_PWD", "")
+        if trade_pwd:
+            ret, data = trade_ctx.unlock_trade(trade_pwd)
+            if ret == RET_OK:
+                log.info("交易解锁成功（API）")
+            elif "GUI" in str(data) or "屏蔽" in str(data):
+                log.info("GUI 版 OpenD 检测到，跳过 API 解锁（请确认已在 OpenD 界面手动解锁）")
+            else:
+                log.error(f"交易解锁失败: {data}")
+                trade_ctx.close()
+                quote_ctx.close()
+                return
+        else:
+            log.info("未配置交易密码，跳过 API 解锁（请确认已在 OpenD 界面手动解锁）")
+
     bot = BotState()
 
     try:
@@ -850,7 +893,7 @@ def run(args):
                 _last_cfg_log = cfg_summary
 
             # ── 拉取市场数据 ──────────────────────────────────
-            price, ask_depth, bid_depth, imbalance = fetch_market_data(
+            price, ask_depth, bid_depth, imbalance, best_ask = fetch_market_data(
                 quote_ctx, conn
             )
             if price is None:
@@ -863,13 +906,16 @@ def run(args):
                 conn, ask_depth, price
             )
             entry_score, sig_type, en_signals = compute_entry_score(
-                conn, squeeze_score, price, ask_depth, imbalance
+                conn, squeeze_score, price, ask_depth, imbalance,
+                entry_threshold=dyn_high_entry,
+                safe_squeeze=dyn_safe_squeeze,
             )
             all_signals = sq_reasons + en_signals
 
             # ── 打印仪表盘 ────────────────────────────────────
             print_dashboard(bot, price, squeeze_score, entry_score,
-                            sig_type, imbalance, all_signals, dry_run)
+                            sig_type, imbalance, all_signals, dry_run,
+                            confirm_total=dyn_confirm_rounds)
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # 状态机逻辑
@@ -909,9 +955,14 @@ def run(args):
                         qty = (HALF_QTY if entry_score < 75 else FULL_QTY)
                         qty = min(qty, max_qty)
 
-                        ok = place_short_order(trade_ctx, price, qty, dry_run)
+                        # 港股卖空订单价格须 ≥ 卖一价，用 best_ask 下单
+                        order_price = best_ask if best_ask else price
+                        if best_ask and best_ask > price:
+                            log.info(f"[下单价格] 最新价={price} 卖一价={best_ask}，使用卖一价下单")
+
+                        ok = place_short_order(trade_ctx, order_price, qty, dry_run)
                         if ok:
-                            # 动态计算目标价和止损（使用本轮配置的百分比）
+                            # 动态计算目标价和止损（基于最新成交价，非下单价）
                             _args_override = type("A", (), {
                                 "stop":    args.stop,
                                 "target1": args.target1,
@@ -920,9 +971,9 @@ def run(args):
                                 "_t2_pct": dyn_t2_pct,
                                 "_stop_pct": dyn_stop_pct,
                             })()
-                            dyn_stop, dyn_t1, dyn_t2 = _calc_targets(price, _args_override)
+                            dyn_stop, dyn_t1, dyn_t2 = _calc_targets(order_price, _args_override)
                             bot.position = Position(
-                                entry_price = price,
+                                entry_price = order_price,
                                 qty         = qty,
                                 entry_time  = datetime.datetime.now().isoformat("seconds"),
                                 stop_price  = dyn_stop,
@@ -1158,8 +1209,10 @@ def parse_args():
                    help="固定第二目标价（0=动态，默认0）")
     p.add_argument("--interval", type=int,   default=POLL_INTERVAL,
                    help=f"轮询间隔秒数，默认 {POLL_INTERVAL}")
-    p.add_argument("--dry-run",  action="store_true",
+    p.add_argument("--dry-run",   action="store_true",
                    help="仅模拟信号输出，不实际下单")
+    p.add_argument("--trade-pwd", type=str, default="",
+                   help="富途实盘交易密码（推荐用环境变量 FUTU_TRADE_PWD 代替）")
     return p.parse_args()
 
 

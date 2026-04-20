@@ -15,6 +15,13 @@
 
 set -euo pipefail
 
+# 自动加载 .env 文件（若存在）
+if [[ -f ".env" ]]; then
+  set -a
+  source .env
+  set +a
+fi
+
 DATE=$(date +%Y%m%d)
 LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
