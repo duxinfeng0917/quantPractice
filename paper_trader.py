@@ -58,6 +58,7 @@ from futu import (
     TrdSide,
     OrderType,
     TrdMarket,
+    SecurityFirm,
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -68,10 +69,18 @@ STOCK_CODE    = "00100"
 OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
-# 富途模拟 MARGIN 账户
+# ── 账户配置（切换实盘只需改这三行）────────────────────────
+# 模拟账户
 SIM_ACC_ID    = 18982257
 SIM_ENV       = TrdEnv.SIMULATE
 SIM_MARKET    = TrdMarket.HK
+SIM_FIRM      = None                          # 模拟账户无需指定券商
+
+# 实盘账户（切换时取消注释，注释掉上面四行）
+# SIM_ACC_ID = 281756478968301696
+# SIM_ENV    = TrdEnv.REAL
+# SIM_MARKET = TrdMarket.HK
+# SIM_FIRM   = SecurityFirm.FUTUSECURITIES
 
 DB_PATH            = "short_data.db"       # 与 short_squeeze_monitor.py 共享
 TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
@@ -803,12 +812,12 @@ def run(args):
     if ret != RET_OK:
         log.warning(f"订阅行情失败: {err}")
 
-    # 连接富途交易（模拟）
+    # 连接富途交易
     trade_ctx = OpenSecTradeContext(
         filter_trdmarket = SIM_MARKET,
         host = OPEND_HOST,
         port = OPEND_PORT,
-        security_firm = None,
+        security_firm = SIM_FIRM,
     )
 
     bot = BotState()
