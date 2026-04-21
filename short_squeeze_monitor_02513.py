@@ -1,7 +1,7 @@
 """
-short_squeeze_monitor.py  (普通账户实用版 v2)
+short_squeeze_monitor_02513.py  (普通账户实用版 v2)
 =============================================
-MINIMAX-W (00100.HK) 逼空行情程序化监控
+质谱 (02513.HK) 逼空行情程序化监控
 面向富途普通账户，四路信号并行驱动：
 
   ① HKEX 网页爬取  —— 每日真实卖空成交量 / 卖空占比（替代融券余量）
@@ -42,8 +42,8 @@ from futu import OpenQuoteContext, SubType, RET_OK, Market
 # ═══════════════════════════════════════════════════════════
 # 一、配置
 # ═══════════════════════════════════════════════════════════
-SYMBOL        = "HK.00100"        # MINIMAX-W，港交所代码 00100
-STOCK_CODE    = "00100"           # 纯代码，HKEX 爬虫用
+SYMBOL        = "HK.02513"        # 质谱，港交所代码 02513
+STOCK_CODE    = "02513"           # 纯代码，HKEX 爬虫用
 OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
@@ -51,7 +51,7 @@ OPEND_PORT    = 11111
 REALTIME_INTERVAL = 60            # 实时数据（摆盘/资金流向）轮询间隔（秒）
 HKEX_FETCH_HOUR   = 17            # 每日几点后拉取 HKEX 数据（港股 16:00 收盘，17:00 数据稳定）
 
-DB_PATH = "short_data.db"
+DB_PATH = "short_data_02513.db"
 
 # 逼空信号阈值
 SHORT_RATIO_WINDOW   = 5          # 卖空占比趋势回看天数
@@ -253,7 +253,7 @@ def scrape_hkex_short(date: datetime.date, stock_code: str = STOCK_CODE
     爬取 HKEX Daily Quotations 中的 SHORT SELLING TURNOVER 段落。
 
     文件格式为固定宽度预格式化文本（<pre> 标签），数据行示例：
-        100 MINIMAX-W     323,100   274,762,770   2,149,528   1,869,742,390
+        2513 ZYMEWORKS-W     323,100   274,762,770   2,149,528   1,869,742,390
     列顺序：CODE  NAME  SHORT_VOL(SH)  SHORT_VALUE($)  TOTAL_VOL(SH)  TOTAL_VALUE($)
 
     股票代码在文件中为纯整数（100），无前导零。
@@ -1167,7 +1167,7 @@ def print_dashboard(
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║   MINIMAX-W (00100.HK)  做空监控仪表盘   {now}  ║
+║   质谱 (02513.HK)  做空监控仪表盘   {now}      ║
 ╠══════════════════════════════════════════════════════════╣
 ║  最新价         : {str(state.last_price or 'N/A'):>10}                        ║
 ╠══════════════════════════════════════════════════════════╣
@@ -1400,17 +1400,19 @@ def cmd_export(out_csv: str = "snapshots_export.csv"):
     print(f"已导出: orderbook_{out_csv}, capital_{out_csv}, hkex_{out_csv}")
 
 
-def cmd_backfill(days: int = 10):
+def cmd_backfill(trade_days: int = 30):
     """
-    补抓最近 N 个自然日的 HKEX 数据（跳过非交易日）。
-    用于首次运行后初始化趋势分析所需的历史数据。
+    补抓最近 N 个交易日的 HKEX 数据（自动跳过周末）。
+    默认 30 个交易日，满足 20 日成本线所需历史深度。
     """
     conn = init_db(DB_PATH)
     ctx  = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
     today = datetime.date.today()
     fetched = 0
-    for delta in range(1, days + 1):
+    delta = 1
+    while fetched < trade_days:
         d = today - datetime.timedelta(days=delta)
+        delta += 1
         if d.weekday() >= 5:          # 跳过周末
             continue
         ratio = fetch_hkex_and_store(conn, ctx, d)
@@ -1429,7 +1431,7 @@ if __name__ == "__main__":
     import argparse as _ap
 
     _p = _ap.ArgumentParser(
-        description="MINIMAX-W 做空监控系统",
+        description="质谱(02513.HK) 做空监控系统",
         formatter_class=_ap.RawDescriptionHelpFormatter,
         epilog="""
 子命令：
@@ -1456,8 +1458,11 @@ if __name__ == "__main__":
                     metavar="PCT",   help="第一目标利润百分比，默认 1.5（%%）")
     _p.add_argument("--t2-pct",     type=float, default=3.0,
                     metavar="PCT",   help="第二目标利润百分比，默认 3.0（%%）")
+    _p.add_argument("--days",       type=int,   default=30,
+                    metavar="N",     help="backfill 回溯交易日数，默认 30")
 
     _args = _p.parse_args()
+    _args.backfill_days = _args.days
 
     # 构建持仓对象
     _held = None
@@ -1477,4 +1482,4 @@ if __name__ == "__main__":
     elif _args.cmd == "export":
         cmd_export()
     elif _args.cmd == "backfill":
-        cmd_backfill()
+        cmd_backfill(trade_days=_args.backfill_days)
