@@ -48,7 +48,7 @@ OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
 # 轮询间隔
-REALTIME_INTERVAL = 60            # 实时数据（摆盘/资金流向）轮询间隔（秒）
+REALTIME_INTERVAL = 15            # 实时数据（摆盘/资金流向）轮询间隔（秒）
 HKEX_FETCH_HOUR   = 17            # 每日几点后拉取 HKEX 数据（港股 16:00 收盘，17:00 数据稳定）
 
 DB_PATH = "short_data.db"

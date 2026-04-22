@@ -6,9 +6,9 @@ MINIMAX-W (HK.00100) 模拟账户自动做空交易机器人
 基于 short_squeeze_monitor.py 的信号引擎，在富途模拟 MARGIN 账户上自动下单。
 
 入场规则（4 条件全满足）：
-    1. 做空入场评分 ≥ 65（HIGH_ENTRY_SCORE）
-    2. 连续 2 轮维持 ENTRY 信号（排除单轮噪声）
-    3. 逼空评分 < 20（SAFE_SQUEEZE_SCORE）
+    1. 做空入场评分 ≥ 60 monitor 对齐）
+    2. 连续 1 轮维持 ENTRY 信号（15s 轮询下足够过滤噪声）
+    3. 逼空评分 < 20 monitor 对齐）
     4. 摆盘失衡度 < +0.60（ENTRY_IMB_THRESHOLD）— 排除订单簿极度偏多的情况
 
 仓位管理：
@@ -102,7 +102,7 @@ SIM_FIRM   = SecurityFirm.FUTUSECURITIES
 
 DB_PATH            = "short_data.db"       # 与 short_squeeze_monitor.py 共享
 TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
-POLL_INTERVAL      = 60                    # 轮询秒数
+POLL_INTERVAL      = 15                    # 轮询秒数（15s：4倍密度，可捕捉分钟内高低点）
 
 import os as _os
 _LOG_DIR   = "logs"
@@ -111,10 +111,10 @@ TRADER_LOG = _os.path.join(_LOG_DIR, f"paper_trader_{_LOG_DATE}.log")
 _os.makedirs(_LOG_DIR, exist_ok=True)
 
 # ── 入场条件 ──────────────────────────────────────────────
-HIGH_ENTRY_SCORE    = 65              # 最低入场评分
-SAFE_SQUEEZE_SCORE  = 20             # 最大允许逼空评分
+HIGH_ENTRY_SCORE    = 60              # 最低入场评分（与 short_squeeze_monitor.py 的 SHORT_ENTRY_MIN 一致）
+SAFE_SQUEEZE_SCORE  = 20             # 最大允许逼空评分（与 monitor 的 SHORT_SAFE_SQUEEZE 一致）
 ENTRY_IMB_THRESHOLD = 0.60           # 失衡度低于此值才允许入场（排除极度偏多）
-ENTRY_CONFIRM_ROUNDS = 2             # 连续 ENTRY 信号轮数
+ENTRY_CONFIRM_ROUNDS = 1             # 连续 ENTRY 信号轮数（15s 轮询下 1 轮 = 15s 确认，窗口够用）
 CLOSE_GUARD_TIME = datetime.time(15, 50)  # 此时间后禁止开新仓（HKT）
 
 # ── 仓位管理 ──────────────────────────────────────────────
@@ -173,10 +173,10 @@ def load_config() -> dict:
     文件不存在或解析失败时返回空字典，调用方使用模块级常量作为兜底。
 
     支持的字段（均可省略，省略则使用代码默认值）：
-        HIGH_ENTRY_SCORE    int    最低入场评分（默认 65）
-        SAFE_SQUEEZE_SCORE  int    最大允许逼空评分（默认 20）
+        HIGH_ENTRY_SCORE    int    最低入场评分（默认 55）
+        SAFE_SQUEEZE_SCORE  int    最大允许逼空评分（默认 25）
         ENTRY_IMB_THRESHOLD float  失衡度上限（默认 0.60）
-        ENTRY_CONFIRM_ROUNDS int   连续确认轮数（默认 2）
+        ENTRY_CONFIRM_ROUNDS int   连续确认轮数（默认 1）
         EMERGENCY_SQUEEZE   int    紧急平仓逼空阈值（默认 35）
         CLOSE_GUARD_TIME    str    收盘禁开仓时间 "HH:MM"（默认 "15:50"）
         TARGET1_PCT         float  第一目标跌幅（默认 0.015）
