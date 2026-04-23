@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 from pathlib import Path
+from shared_config import HKEX_COST_WINDOW, STOCKS, DEFAULT_STOCK
 
 # 自动加载 .env 文件（若存在），不依赖第三方库
 def _load_dotenv(path: str = ".env"):
@@ -82,8 +83,10 @@ from futu import (
 # ═══════════════════════════════════════════════════════════
 # 一、配置
 # ═══════════════════════════════════════════════════════════
-SYMBOL        = "HK.00100"
-STOCK_CODE    = "00100"
+# 以下由 --stock 参数在启动时覆盖（见 shared_config.py STOCKS 字典）
+SYMBOL        = STOCKS[DEFAULT_STOCK]["symbol"]
+STOCK_CODE    = STOCKS[DEFAULT_STOCK]["stock_code"]
+STOCK_NAME    = STOCKS[DEFAULT_STOCK]["name"]
 OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
@@ -100,7 +103,7 @@ SIM_ENV    = TrdEnv.REAL
 SIM_MARKET = TrdMarket.HK
 SIM_FIRM   = SecurityFirm.FUTUSECURITIES
 
-DB_PATH            = "short_data.db"       # 与 short_squeeze_monitor.py 共享
+DB_PATH            = STOCKS[DEFAULT_STOCK]["db_path"]
 TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
 POLL_INTERVAL      = 15                    # 轮询秒数（15s：4倍密度，可捕捉分钟内高低点）
 
@@ -377,7 +380,7 @@ def analyze_hkex_momentum(conn: sqlite3.Connection,
     short_vals   = [r[2] for r in rows]
     short_ratios = [r[3] for r in rows]
 
-    n = min(len(rows), 6)
+    n = min(len(rows), HKEX_COST_WINDOW)
     total_val = sum(short_vals[:n])
     total_vol = sum(short_vols[:n])
     weighted_cost = (total_val / total_vol) if total_vol > 0 else None
@@ -1207,8 +1210,11 @@ def parse_args():
                    help="固定第一目标价（0=动态，默认0）")
     p.add_argument("--target2",  type=float, default=0,
                    help="固定第二目标价（0=动态，默认0）")
-    p.add_argument("--interval", type=int,   default=POLL_INTERVAL,
-                   help=f"轮询间隔秒数，默认 {POLL_INTERVAL}")
+    p.add_argument("--stock", "-s", default=DEFAULT_STOCK,
+                   metavar="CODE",
+                   help=f"股票代码，支持: {', '.join(STOCKS)}（默认 {DEFAULT_STOCK}）")
+    p.add_argument("--interval", type=int,   default=None,
+                   help="轮询间隔秒数（默认从股票配置读取）")
     p.add_argument("--dry-run",   action="store_true",
                    help="仅模拟信号输出，不实际下单")
     p.add_argument("--trade-pwd", type=str, default="",
@@ -1218,5 +1224,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    POLL_INTERVAL = args.interval
+    # ── 应用股票配置 ──────────────────────────────────────────
+    _stock_cfg = STOCKS.get(args.stock)
+    if not _stock_cfg:
+        print(f"未知股票代码 {args.stock!r}，支持: {', '.join(STOCKS)}", file=sys.stderr)
+        sys.exit(1)
+    SYMBOL        = _stock_cfg["symbol"]
+    STOCK_CODE    = _stock_cfg["stock_code"]
+    STOCK_NAME    = _stock_cfg["name"]
+    DB_PATH       = _stock_cfg["db_path"]
+    POLL_INTERVAL = args.interval if args.interval is not None else _stock_cfg["poll_interval"]
     run(args)

@@ -34,6 +34,7 @@ import datetime
 import statistics
 from dataclasses import dataclass, field
 from typing import Optional
+from shared_config import HKEX_COST_WINDOW, STOCKS, DEFAULT_STOCK
 
 import requests
 import pandas as pd
@@ -42,16 +43,17 @@ from futu import OpenQuoteContext, SubType, RET_OK, Market
 # ═══════════════════════════════════════════════════════════
 # 一、配置
 # ═══════════════════════════════════════════════════════════
-SYMBOL        = "HK.00100"        # MINIMAX-W，港交所代码 00100
-STOCK_CODE    = "00100"           # 纯代码，HKEX 爬虫用
+# 以下由 --stock 参数在启动时覆盖（见 shared_config.py STOCKS 字典）
+SYMBOL        = STOCKS[DEFAULT_STOCK]["symbol"]
+STOCK_CODE    = STOCKS[DEFAULT_STOCK]["stock_code"]
+STOCK_NAME    = STOCKS[DEFAULT_STOCK]["name"]
 OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
-# 轮询间隔
-REALTIME_INTERVAL = 15            # 实时数据（摆盘/资金流向）轮询间隔（秒）
+REALTIME_INTERVAL = STOCKS[DEFAULT_STOCK]["poll_interval"]
 HKEX_FETCH_HOUR   = 17            # 每日几点后拉取 HKEX 数据（港股 16:00 收盘，17:00 数据稳定）
 
-DB_PATH = "short_data.db"
+DB_PATH = STOCKS[DEFAULT_STOCK]["db_path"]
 
 # 逼空信号阈值
 SHORT_RATIO_WINDOW   = 5          # 卖空占比趋势回看天数
@@ -247,7 +249,7 @@ def _hkex_url(date: datetime.date) -> str:
     )
 
 
-def scrape_hkex_short(date: datetime.date, stock_code: str = STOCK_CODE
+def scrape_hkex_short(date: datetime.date, stock_code: Optional[str] = None
                       ) -> Optional[dict]:
     """
     爬取 HKEX Daily Quotations 中的 SHORT SELLING TURNOVER 段落。
@@ -258,6 +260,7 @@ def scrape_hkex_short(date: datetime.date, stock_code: str = STOCK_CODE
 
     股票代码在文件中为纯整数（100），无前导零。
     """
+    stock_code = stock_code or STOCK_CODE
     import re as _re
 
     url = _hkex_url(date)
@@ -614,7 +617,7 @@ def analyze_hkex_short_momentum(
 
     返回: (做空支撑分, 逼空风险加成分, signals, stats字典)
     """
-    COST_WINDOW     = 10  # 成本线窗口：覆盖2周建仓周期，减少单日卖空量扭曲
+    COST_WINDOW     = HKEX_COST_WINDOW  # 与 paper_trader.py 共享，见 shared_config.py
     COST_WINDOW_MID = 20  # 中期成本线窗口：月度视角，判断中期空头整体盈亏
     MOMENTUM_WINDOW = 5   # 动能/爆量基准：一个完整交易周
 
@@ -1167,7 +1170,7 @@ def print_dashboard(
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║   MINIMAX-W (00100.HK)  做空监控仪表盘   {now}  ║
+║   {STOCK_NAME} ({STOCK_CODE}.HK)  做空监控仪表盘   {now}  ║
 ╠══════════════════════════════════════════════════════════╣
 ║  最新价         : {str(state.last_price or 'N/A'):>10}                        ║
 ╠══════════════════════════════════════════════════════════╣
@@ -1443,6 +1446,9 @@ if __name__ == "__main__":
   python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000 --stop-pct 3.5 --t1-pct 1.5 --t2-pct 3.0
 """
     )
+    _p.add_argument("--stock", "-s", default=DEFAULT_STOCK,
+                    metavar="CODE",
+                    help=f"股票代码，支持: {', '.join(STOCKS)}（默认 {DEFAULT_STOCK}）")
     _p.add_argument("cmd", nargs="?", default="monitor",
                     choices=["monitor", "backfill", "signals", "export"],
                     help="子命令（默认 monitor）")
@@ -1458,6 +1464,17 @@ if __name__ == "__main__":
                     metavar="PCT",   help="第二目标利润百分比，默认 3.0（%%）")
 
     _args = _p.parse_args()
+
+    # ── 应用股票配置 ──────────────────────────────────────────
+    _stock_cfg = STOCKS.get(_args.stock)
+    if not _stock_cfg:
+        print(f"未知股票代码 {_args.stock!r}，支持: {', '.join(STOCKS)}", file=sys.stderr)
+        sys.exit(1)
+    SYMBOL            = _stock_cfg["symbol"]
+    STOCK_CODE        = _stock_cfg["stock_code"]
+    STOCK_NAME        = _stock_cfg["name"]
+    DB_PATH           = _stock_cfg["db_path"]
+    REALTIME_INTERVAL = _stock_cfg["poll_interval"]
 
     # 构建持仓对象
     _held = None

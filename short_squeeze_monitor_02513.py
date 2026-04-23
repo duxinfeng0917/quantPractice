@@ -1,6 +1,9 @@
 """
-short_squeeze_monitor_02513.py  (普通账户实用版 v2)
-=============================================
+short_squeeze_monitor_02513.py  — 已废弃
+=========================================
+此脚本已被 short_squeeze_monitor.py --stock 02513 取代，保留仅供参考。
+新用法：python3 short_squeeze_monitor.py --stock 02513
+
 质谱 (02513.HK) 逼空行情程序化监控
 面向富途普通账户，四路信号并行驱动：
 
@@ -34,6 +37,7 @@ import datetime
 import statistics
 from dataclasses import dataclass, field
 from typing import Optional
+from shared_config import HKEX_COST_WINDOW
 
 import requests
 import pandas as pd
@@ -614,7 +618,7 @@ def analyze_hkex_short_momentum(
 
     返回: (做空支撑分, 逼空风险加成分, signals, stats字典)
     """
-    COST_WINDOW     = 10  # 成本线窗口：覆盖2周建仓周期，减少单日卖空量扭曲
+    COST_WINDOW     = HKEX_COST_WINDOW  # 与 paper_trader.py / short_squeeze_monitor.py 共享
     COST_WINDOW_MID = 20  # 中期成本线窗口：月度视角，判断中期空头整体盈亏
     MOMENTUM_WINDOW = 5   # 动能/爆量基准：一个完整交易周
 
