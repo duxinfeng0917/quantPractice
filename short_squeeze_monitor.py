@@ -138,6 +138,18 @@ def init_db(db_path: str) -> sqlite3.Connection:
             ts     TEXT,
             price  REAL
         );
+
+        CREATE TABLE IF NOT EXISTS monitor_state (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            ts            TEXT,
+            squeeze_score INTEGER,
+            short_score   INTEGER,
+            short_signal  TEXT,
+            price         REAL,
+            ask_depth     REAL,
+            imbalance     REAL,
+            big_net       REAL
+        );
     """)
     conn.commit()
     return conn
@@ -186,6 +198,21 @@ def db_save_signal(conn: sqlite3.Connection, sig_type: str,
     conn.execute(
         "INSERT INTO signals VALUES (NULL,?,?,?,?)",
         (ts, sig_type, detail, score),
+    )
+    conn.commit()
+
+
+def db_write_monitor_state(
+    conn: sqlite3.Connection,
+    squeeze_score: int, short_score: int, short_signal: str,
+    price: Optional[float], ask_depth: Optional[float],
+    imbalance: Optional[float], big_net: Optional[float],
+):
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT OR REPLACE INTO monitor_state VALUES (1,?,?,?,?,?,?,?,?)",
+        (ts, squeeze_score, short_score, short_signal,
+         price, ask_depth, imbalance, big_net),
     )
     conn.commit()
 
@@ -1321,6 +1348,13 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 short_signal = "CAUTION"
             state.short_score  = short_score
             state.short_signal = short_signal
+
+            # ── 写入共享评分供 paper_trader 读取 ─────────────────
+            db_write_monitor_state(
+                conn, squeeze_score, short_score, short_signal,
+                state.last_price, state.latest_ask_depth,
+                state.latest_imbalance, state.latest_big_net,
+            )
 
             # ── 持仓离场风险（仅在持仓时评估）───────────────────────
             exit_urgency, exit_reasons = 0, []

@@ -262,6 +262,18 @@ class BotState:
 def init_trade_db(conn: sqlite3.Connection):
     """在共享 DB 中新建交易记录表（若不存在）。"""
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS monitor_state (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            ts            TEXT,
+            squeeze_score INTEGER,
+            short_score   INTEGER,
+            short_signal  TEXT,
+            price         REAL,
+            ask_depth     REAL,
+            imbalance     REAL,
+            big_net       REAL
+        );
+
         CREATE TABLE IF NOT EXISTS paper_trades (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT,
@@ -358,6 +370,40 @@ def db_save_signal(conn: sqlite3.Connection, sig_type: str,
         (ts, sig_type, detail, score),
     )
     conn.commit()
+
+
+_MONITOR_STATE_STALE_SEC = 45   # monitor_state 超过此秒数视为陈旧，降级自算
+
+
+def db_read_monitor_state(conn: sqlite3.Connection) -> Optional[dict]:
+    """
+    读取 monitor 写入的最新评分。
+    若数据不存在或距现在超过 _MONITOR_STATE_STALE_SEC 秒，返回 None（触发降级自算）。
+    """
+    row = conn.execute(
+        "SELECT ts, squeeze_score, short_score, short_signal, "
+        "price, ask_depth, imbalance, big_net FROM monitor_state WHERE id=1"
+    ).fetchone()
+    if row is None:
+        return None
+    ts_str, squeeze_score, short_score, short_signal, price, ask_depth, imbalance, big_net = row
+    try:
+        ts = datetime.datetime.fromisoformat(ts_str)
+    except Exception:
+        return None
+    age = (datetime.datetime.now() - ts).total_seconds()
+    if age > _MONITOR_STATE_STALE_SEC:
+        return None
+    return {
+        "ts": ts_str, "age": age,
+        "squeeze_score": squeeze_score,
+        "short_score": short_score,
+        "short_signal": short_signal,
+        "price": price,
+        "ask_depth": ask_depth,
+        "imbalance": imbalance,
+        "big_net": big_net,
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -904,16 +950,24 @@ def run(args):
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── 计算评分 ──────────────────────────────────────
-            squeeze_score, sq_reasons = compute_squeeze_score(
-                conn, ask_depth, price
-            )
-            entry_score, sig_type, en_signals = compute_entry_score(
-                conn, squeeze_score, price, ask_depth, imbalance,
-                entry_threshold=dyn_high_entry,
-                safe_squeeze=dyn_safe_squeeze,
-            )
-            all_signals = sq_reasons + en_signals
+            # ── 读取 monitor 共享评分（优先），降级时自算 ────────
+            ms = db_read_monitor_state(conn)
+            if ms is not None:
+                squeeze_score = ms["squeeze_score"]
+                entry_score   = ms["short_score"]
+                sig_type      = ms["short_signal"]
+                all_signals   = [f"[monitor {ms['age']:.0f}s前] 共享评分"]
+            else:
+                log.warning("[共享评分] monitor_state 不存在或已陈旧，降级自算")
+                squeeze_score, sq_reasons = compute_squeeze_score(
+                    conn, ask_depth, price
+                )
+                entry_score, sig_type, en_signals = compute_entry_score(
+                    conn, squeeze_score, price, ask_depth, imbalance,
+                    entry_threshold=dyn_high_entry,
+                    safe_squeeze=dyn_safe_squeeze,
+                )
+                all_signals = sq_reasons + en_signals
 
             # ── 打印仪表盘 ────────────────────────────────────
             print_dashboard(bot, price, squeeze_score, entry_score,
