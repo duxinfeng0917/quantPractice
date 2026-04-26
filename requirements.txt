@@ -1,0 +1,12 @@
+# Core runtime dependencies
+futu-api>=9.0
+pandas>=2.0
+requests>=2.31
+lxml>=5.0
+akshare>=1.10
+yfinance>=0.2
+
+# Dev / linting (optional)
+# pytest>=8.0
+# mypy>=1.8
+# ruff>=0.4
