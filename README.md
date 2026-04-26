@@ -227,9 +227,10 @@ HKEX 网站 ──爬取──► short_squeeze_monitor.py
 
 ---
 
-## 其他数据脚本
+## 其他文件
 
-| 脚本 | 功能 |
+| 文件 | 说明 |
 |------|------|
-| `Demo1.py` | akshare 拉取美股 OHLCV（EastMoney 数据源，无需 API Key） |
-| `Demo2.py` | yfinance 拉取股票历史数据（Yahoo Finance） |
+| `shared_config.py` | 股票配置表（STOCKS 字典）+ 共享常量，新增股票在此添加 |
+| `config/trader_config.json` | 模拟交易机器人可热更新阈值参数 |
+| `config/example.env` | 环境变量模板（复制为 `.env` 后填写 `FUTU_TRADE_PWD`）|

@@ -1,1 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
 
+# Logs
+logs/
+*.log
+nohup.out
+
+# Databases
+*.db
+
+# Secrets & env
+.env
+
+# Position state (runtime)
+short_position.json
+
+# Data exports (large CSVs)
+data/exports/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/

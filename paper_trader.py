@@ -104,7 +104,7 @@ SIM_MARKET = TrdMarket.HK
 SIM_FIRM   = SecurityFirm.FUTUSECURITIES
 
 DB_PATH            = STOCKS[DEFAULT_STOCK]["db_path"]
-TRADER_CONFIG_FILE = "trader_config.json"  # 热更新配置文件
+TRADER_CONFIG_FILE = "config/trader_config.json"  # 热更新配置文件
 POLL_INTERVAL      = 15                    # 轮询秒数（15s：4倍密度，可捕捉分钟内高低点）
 
 import os as _os

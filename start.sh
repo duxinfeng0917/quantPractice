@@ -67,8 +67,8 @@ start_trader() {
     return 1
   fi
 
-  if [[ ! -f "trader_config.json" ]]; then
-    echo "[提示] 未找到 trader_config.json，将使用代码默认阈值"
+  if [[ ! -f "config/trader_config.json" ]]; then
+    echo "[提示] 未找到 config/trader_config.json，将使用代码默认阈值"
   fi
 
   nohup python3 -u "$TRADER_SCRIPT" --stock "$STOCK" "$@" >> "$TRADER_NOHUP" 2>&1 &
