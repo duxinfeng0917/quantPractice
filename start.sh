@@ -45,6 +45,8 @@ TRADER_SCRIPT="paper_trader.py"
 MONITOR_NOHUP="$LOG_DIR/monitor_stdout_${STOCK}_${DATE}.log"
 TRADER_NOHUP="$LOG_DIR/trader_stdout_${STOCK}_${DATE}.log"
 
+PYTHON="/Users/duxinfeng/miniconda3/envs/finance_env/bin/python"
+
 # ── 辅助函数 ──────────────────────────────────────────────
 start_monitor() {
   # 检查同一股票的 monitor 是否已在运行
@@ -53,7 +55,7 @@ start_monitor() {
     echo "       如需重启，先运行: bash start.sh stop"
     return 1
   fi
-  nohup python3 -u "$MONITOR_SCRIPT" --stock "$STOCK" >> "$MONITOR_NOHUP" 2>&1 &
+  nohup "$PYTHON" -u "$MONITOR_SCRIPT" --stock "$STOCK" >> "$MONITOR_NOHUP" 2>&1 &
   echo "[启动] monitor(${STOCK})  PID=$!"
   echo "       stdout  → $MONITOR_NOHUP"
   echo "       日志    → $LOG_DIR/short_monitor_${DATE}.log"
@@ -71,7 +73,7 @@ start_trader() {
     echo "[提示] 未找到 config/trader_config.json，将使用代码默认阈值"
   fi
 
-  nohup python3 -u "$TRADER_SCRIPT" --stock "$STOCK" "$@" >> "$TRADER_NOHUP" 2>&1 &
+  nohup "$PYTHON" -u "$TRADER_SCRIPT" --stock "$STOCK" "$@" >> "$TRADER_NOHUP" 2>&1 &
   echo "[启动] trader(${STOCK})   PID=$!"
   echo "       参数    → --stock $STOCK $*"
   echo "       stdout  → $TRADER_NOHUP"

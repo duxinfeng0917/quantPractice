@@ -1437,7 +1437,7 @@ def cmd_export(out_csv: str = "snapshots_export.csv"):
     print(f"已导出: orderbook_{out_csv}, capital_{out_csv}, hkex_{out_csv}")
 
 
-def cmd_backfill(days: int = 10):
+def cmd_backfill(days: int = 40):
     """
     补抓最近 N 个自然日的 HKEX 数据（跳过非交易日）。
     用于首次运行后初始化趋势分析所需的历史数据。

@@ -6,9 +6,9 @@ paper_trader.py 与 short_squeeze_monitor.py 共用的常量。
 """
 
 # HKEX 加权空头成本线窗口（交易日数）
-# 6日 = 约一个完整交易周，重点反映近期新建仓空头的成本压力。
+# 10日 = 约两个完整交易周，是港股空头分析的标准窗口，能更好地平衡灵敏度与稳定性。
 # 两个脚本必须使用同一窗口，否则会对"空头是否亏损"得出相反结论。
-HKEX_COST_WINDOW = 6
+HKEX_COST_WINDOW = 10
 
 # ── 股票配置表 ──────────────────────────────────────────────
 # 新增股票只需在此追加一条记录，脚本通过 --stock CODE 选择。
@@ -20,12 +20,12 @@ STOCKS: dict = {
         "db_path":       "short_data.db",
         "poll_interval": 15,            # 实时轮询间隔（秒）
     },
-    "02513": {
-        "symbol":        "HK.02513",
-        "stock_code":    "02513",
-        "name":          "质谱",
-        "db_path":       "short_data_02513.db",
-        "poll_interval": 60,
-    },
+    # "02513": {
+    #     "symbol":        "HK.02513",
+    #     "stock_code":    "02513",
+    #     "name":          "质谱",
+    #     "db_path":       "short_data_02513.db",
+    #     "poll_interval": 60,
+    # },
 }
 DEFAULT_STOCK = "00100"

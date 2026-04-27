@@ -1,10 +1,10 @@
 {
   "_comment": "paper_trader.py 热更新配置。修改后下一轮（15秒内）自动生效，无需重启。",
 
-  "HIGH_ENTRY_SCORE":     60,
+  "HIGH_ENTRY_SCORE":     80,
   "SAFE_SQUEEZE_SCORE":   20,
   "ENTRY_IMB_THRESHOLD":  0.60,
-  "ENTRY_CONFIRM_ROUNDS": 1,
+  "ENTRY_CONFIRM_ROUNDS": 2,
 
   "EMERGENCY_SQUEEZE":    35,
 
