@@ -25,6 +25,9 @@ short_position_manager.py
         --stop 950 \\
         --target1 870 --target2 850 \\
         --interval 30
+
+    # 切换股票（02513 使用独立 DB）
+    python3 short_position_manager.py --stock 02513 --entry 50 --qty 1000
 """
 
 from __future__ import annotations
@@ -42,16 +45,17 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from futu import OpenQuoteContext, SubType, RET_OK
+from shared_config import STOCKS, DEFAULT_STOCK
 
 # ═══════════════════════════════════════════════════════════
-# 一、默认配置
+# 一、默认配置（由 --stock 参数在启动时覆盖）
 # ═══════════════════════════════════════════════════════════
-SYMBOL         = "HK.00100"
+SYMBOL         = STOCKS[DEFAULT_STOCK]["symbol"]
 OPEND_HOST     = "127.0.0.1"
 OPEND_PORT     = 11111
-DB_PATH        = "short_data.db"       # 与 short_squeeze_monitor.py 共享
-POSITION_FILE  = "short_position.json" # 持仓快照，跨进程恢复用
-POLL_INTERVAL  = 30                    # 轮询秒数（建议 30s，比监控器更频繁）
+DB_PATH        = STOCKS[DEFAULT_STOCK]["db_path"]   # 与 short_squeeze_monitor.py 共享
+POSITION_FILE  = f"short_position_{DEFAULT_STOCK}.json"  # 持仓快照，跨进程恢复用
+POLL_INTERVAL  = 30                                 # 轮询秒数
 
 # 默认止损 / 目标（可被命令行覆盖）
 DEFAULT_STOP    = 950.0
@@ -60,6 +64,7 @@ DEFAULT_TARGET2 = 850.0
 
 # 平仓评分阈值
 COVER_ALERT_SCORE  = 70   # 强提示
+COVER_NOW_SCORE    = COVER_ALERT_SCORE  # 统一引用，在 evaluate_cover() 中使用
 COVER_WARN_SCORE   = 45   # 预警
 
 # 摆盘信号阈值
@@ -77,12 +82,18 @@ CLOSING_WARN_TIMES = [(15, 30), (15, 45), (15, 55)]
 # ═══════════════════════════════════════════════════════════
 # 二、日志
 # ═══════════════════════════════════════════════════════════
+import os as _os
+_LOG_DIR  = "logs"
+_LOG_DATE = datetime.date.today().strftime("%Y%m%d")
+_LOG_FILE = _os.path.join(_LOG_DIR, f"position_manager_{_LOG_DATE}.log")
+_os.makedirs(_LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("position_manager.log", encoding="utf-8"),
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
