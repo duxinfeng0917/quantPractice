@@ -407,8 +407,9 @@ def fetch_capital_flow(ctx: OpenQuoteContext, conn: sqlite3.Connection
                        ) -> Optional[dict]:
     """
     通过 get_capital_distribution 获取当日资金分布快照。
-    返回各级别净流入（万港元）。
-    普通账户可用，数据为日内累计值，每分钟刷新。
+    返回各级别净流入（原始 HKD，非万港元；显示时需 / 10000）。
+    Futu OpenD 通常每分钟才刷新一次，按 update_time 去重，
+    避免同一快照被多次写入 capital_flow 表，污染信号窗口。
     """
     ret, data = ctx.get_capital_distribution(SYMBOL)
     if ret != RET_OK or data.empty:
@@ -416,7 +417,8 @@ def fetch_capital_flow(ctx: OpenQuoteContext, conn: sqlite3.Connection
         return None
 
     row = data.iloc[0]
-    # 字段：capital_in_big/mid/small, capital_out_big/mid/small（单位：万港元）
+    update_time = row.get("update_time") if "update_time" in row.index else None
+
     def _f(col: str) -> float:
         return float(row.get(col, 0) or 0)
 
@@ -427,13 +429,22 @@ def fetch_capital_flow(ctx: OpenQuoteContext, conn: sqlite3.Connection
     sml_in  = _f("capital_in_small")
     sml_out = _f("capital_out_small")
 
-    ts = datetime.datetime.now().isoformat(timespec="seconds")
     big_net   = big_in - big_out
     mid_net   = mid_in - mid_out
     small_net = sml_in - sml_out
 
+    # 去重：相同 update_time 视为同一快照；缺失时退化为三元组比较。
+    cache_key = update_time if update_time else (big_net, mid_net, small_net)
+    if getattr(fetch_capital_flow, "_last_key", None) == cache_key:
+        return getattr(fetch_capital_flow, "_last_result", None)
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
     db_save_capital(conn, ts, big_in, big_out, big_net, mid_net, small_net)
-    return {"ts": ts, "big_net": big_net, "mid_net": mid_net, "small_net": small_net}
+
+    result = {"ts": ts, "big_net": big_net, "mid_net": mid_net, "small_net": small_net}
+    fetch_capital_flow._last_key = cache_key
+    fetch_capital_flow._last_result = result
+    return result
 
 
 def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:

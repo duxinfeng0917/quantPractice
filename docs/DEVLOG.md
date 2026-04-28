@@ -774,4 +774,20 @@ python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000 --stop-pct 3.5
 
 **决策理由：** 保持主脚本在根目录（避免破坏 start.sh 和 import 路径），仅对配置、数据、文档做目录归类，实现最小侵入式规范化。
 
-*本文档记录截止：2026-04-22，对应项目结构规范化完成时的状态。*
+---
+
+## 迭代九：资金流向快照按 update_time 去重（2026-04-28）
+
+**背景：** 盘中观察到 `大单净流入` 字段在多轮（15s 间隔）内完全保持不变（如 -10913740.0 持续 ~2 分钟）。Futu OpenD 对 `get_capital_distribution` 大约每分钟才刷新一次，主循环每 15s 调用一次会把同一份缓存快照重复写入 `capital_flow` 表。
+
+**后果：**
+1. SQLite `capital_flow` 表灌入大量重复行，膨胀且无信息量。
+2. `analyze_capital_flow` 取 `recent = history[:BIGFLOW_REVERSAL_MIN=2]` 时，相邻两条很可能是同一份缓存，导致"连续 2 轮净流入正值"实质上等价于"同一缓存值刚好为正"，反转信号过于敏感、判断质量低。
+
+**变更内容：**
+- `short_squeeze_monitor.py:fetch_capital_flow` — 读取 Futu 返回行的 `update_time` 字段作为去重键；若缺失则退化为 `(big_net, mid_net, small_net)` 三元组比较。同 key 时跳过 DB 写入并直接返回上次缓存的 dict（仍含旧 ts）。缓存挂在函数对象的 `_last_key` / `_last_result` 属性上，避免引入模块级全局。
+- 函数 docstring 修正单位描述：原始 HKD，非万港元（呼应 `known_bugs_and_gotchas.md` Bug 3）。
+
+**决策理由：** 选择函数属性而非 `MonitorState` 字段，原因是缓存只与 `fetch_capital_flow` 的私有去重逻辑相关，调用方仍能像之前一样把返回 dict 直接赋给 `state.latest_big_net`，不需要感知去重机制。返回缓存 dict 而非 `None` 是为了不破坏 `state.latest_big_net = cf["big_net"]` 的现有写法。
+
+*本文档记录截止：2026-04-28。*
