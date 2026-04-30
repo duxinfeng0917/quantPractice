@@ -127,12 +127,14 @@ class ShortPosition:
             return 0.0
         return (self.entry_price - current_price) / self.entry_price * 100
 
-    def save(self, path: str = POSITION_FILE):
+    def save(self, path: Optional[str] = None):
+        path = path or POSITION_FILE
         with open(path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, ensure_ascii=False, indent=2)
 
     @classmethod
-    def load(cls, path: str = POSITION_FILE) -> "ShortPosition":
+    def load(cls, path: Optional[str] = None) -> "ShortPosition":
+        path = path or POSITION_FILE
         with open(path, encoding="utf-8") as f:
             return cls(**json.load(f))
 
@@ -330,8 +332,6 @@ def evaluate_cover(pos: ShortPosition, st: RuntimeState) -> CoverSignal:
 # ═══════════════════════════════════════════════════════════
 # 七、仪表盘
 # ═══════════════════════════════════════════════════════════
-COVER_NOW_SCORE = COVER_ALERT_SCORE   # 统一引用
-
 
 def print_dashboard(pos: ShortPosition, st: RuntimeState, sig: CoverSignal):
     if st.current_price is None:
@@ -498,6 +498,8 @@ def record_partial_cover(pos: ShortPosition, cover_qty: int, cover_price: float)
 # ═══════════════════════════════════════════════════════════
 def parse_args():
     p = argparse.ArgumentParser(description="空头持仓管理器")
+    p.add_argument("--stock", "-s", default=DEFAULT_STOCK, metavar="CODE",
+                   help=f"股票代码，支持: {', '.join(STOCKS)}（默认 {DEFAULT_STOCK}）")
     p.add_argument("--entry",    type=float, help="开仓均价（HKD）")
     p.add_argument("--qty",      type=int,   help="持仓股数")
     p.add_argument("--stop",     type=float, default=DEFAULT_STOP,    help=f"止损价，默认 {DEFAULT_STOP}")
@@ -513,9 +515,18 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
+    # ── 应用股票配置 ──────────────────────────────────────────
+    _stock_cfg = STOCKS.get(args.stock)
+    if not _stock_cfg:
+        print(f"未知股票代码 {args.stock!r}，支持: {', '.join(STOCKS)}", file=sys.stderr)
+        sys.exit(1)
+    SYMBOL        = _stock_cfg["symbol"]
+    DB_PATH       = _stock_cfg["db_path"]
+    POSITION_FILE = f"short_position_{args.stock}.json"
+
     # 优先从文件加载持仓
     if os.path.exists(POSITION_FILE) and not args.entry:
-        pos = ShortPosition.load()
+        pos = ShortPosition.load(POSITION_FILE)
         log.info(f"已从 {POSITION_FILE} 加载持仓：{pos.entry_price} × {pos.qty}股")
     elif args.entry and args.qty:
         pos = ShortPosition(
@@ -527,7 +538,7 @@ if __name__ == "__main__":
             target1     = args.target1,
             target2     = args.target2,
         )
-        pos.save()
+        pos.save(POSITION_FILE)
         log.info(f"新建持仓：{pos.entry_price} × {pos.qty}股 已保存")
     else:
         print(

@@ -71,6 +71,9 @@ SHORT_IMB_THRESHOLD  = -0.30      # 失衡度低于此值视为持续卖压
 SHORT_IMB_ROUNDS     = 2          # 连续 N 轮失衡度 < 阈值方触发
 SHORT_ENTRY_MIN      = 55         # 做空入场评分门槛（满分 100）
 SHORT_PRICE_WINDOW   = 10         # 价格历史窗口（轮次）
+SHORT_SQUEEZE_LOOKBACK = 4        # 逼空安全门回看 N 轮（取峰值，避免均值稀释）
+SHORT_TRAP_IMB_BLOCK = 0.30       # 摆盘失衡度 > 此值 → 疑似诱空，强制降级
+SHORT_TRAP_IMB_SUPPRESS = 0.10    # 卖盘骤增时若摆盘失衡度 > 此值 → 不计 +25 分
 
 
 # ═══════════════════════════════════════════════════════════
@@ -631,7 +634,7 @@ def analyze_short_ratio_trend(conn: sqlite3.Connection) -> tuple[int, list[str]]
 
 
 # ═══════════════════════════════════════════════════════════
-# 七b、HKEX 历史卖空深度分析
+# 八、HKEX 历史卖空深度分析
 # ═══════════════════════════════════════════════════════════
 
 def analyze_hkex_short_momentum(
@@ -784,7 +787,7 @@ def analyze_hkex_short_momentum(
 
 
 # ═══════════════════════════════════════════════════════════
-# 八、做空信号引擎
+# 九、做空信号引擎
 # ═══════════════════════════════════════════════════════════
 
 def analyze_short_entry(
@@ -793,6 +796,7 @@ def analyze_short_entry(
     current_price: Optional[float],
     current_ask: float,
     current_imbalance: float,
+    recent_max_squeeze: Optional[int] = None,
 ) -> tuple[int, str, list[str]]:
     """
     做空入场评分（0-100）及信号类型。
@@ -809,12 +813,23 @@ def analyze_short_entry(
         3. 摆盘持续偏空                最高 20 分
         4. 价格低于近期高点            最高 15 分
         5. 高点拒绝后连续下行          最高 10 分
+
+    诱空保护：
+        - 卖盘骤增但摆盘仍明显偏多 → 视为挂大卖单后撤单的诱空陷阱，不予加分
+        - 摆盘失衡度 > +0.30（买盘强势）→ 即使评分够也降级到 CAUTION
+        - recent_max_squeeze：近 N 轮逼空评分峰值，避免均值滑动稀释绕过安全门
     """
-    # ── 安全门：逼空风险过高直接拦截 ──────────────────────
-    if squeeze_score > SHORT_SAFE_SQUEEZE:
-        return 0, "BLOCKED", [
-            f"逼空评分={squeeze_score} 超过安全线 {SHORT_SAFE_SQUEEZE}，禁止开空"
-        ]
+    # ── 安全门：逼空风险过高直接拦截（用近 N 轮峰值，避免被均值稀释）──
+    effective_squeeze = max(squeeze_score, recent_max_squeeze or 0)
+    if effective_squeeze > SHORT_SAFE_SQUEEZE:
+        if recent_max_squeeze and recent_max_squeeze > squeeze_score:
+            reason = (f"逼空评分={squeeze_score}（近 {SHORT_SQUEEZE_LOOKBACK} "
+                      f"轮峰值 {recent_max_squeeze}）超过安全线 "
+                      f"{SHORT_SAFE_SQUEEZE}，禁止开空")
+        else:
+            reason = (f"逼空评分={squeeze_score} 超过安全线 "
+                      f"{SHORT_SAFE_SQUEEZE}，禁止开空")
+        return 0, "BLOCKED", [reason]
 
     score   = 0
     signals: list[str] = []
@@ -844,18 +859,32 @@ def analyze_short_entry(
         avg_ask = statistics.mean(ask_history[1:])   # 排除当前轮
         if avg_ask > 0:
             surge_pct = (current_ask - avg_ask) / avg_ask * 100
+            # 诱空检测：卖盘骤增但摆盘仍明显偏多 → 大卖单与买盘强势同时存在，
+            # 通常是挂单制造空头跟风后立即撤单的套路，不予加分。
+            trap_suspect = current_imbalance > SHORT_TRAP_IMB_SUPPRESS
             if surge_pct >= SHORT_ASK_SURGE_PCT:
-                pts = 25
-                msg = (f"卖盘深度骤增 {surge_pct:.1f}%（当前 {current_ask:,.0f} "
-                       f"vs 均值 {avg_ask:,.0f} 股），大卖单涌入 [+{pts}分]")
-                score += pts
-                signals.append(msg)
-                db_save_signal(conn, "SHORT_ASK_SURGE", msg, pts)
+                if trap_suspect:
+                    msg = (f"⚠ 卖盘骤增 {surge_pct:.1f}% 但摆盘失衡度 "
+                           f"{current_imbalance:+.3f} 偏多，疑似诱空挂单，不计分")
+                    signals.append(msg)
+                    db_save_signal(conn, "SHORT_ASK_SURGE_TRAP", msg, 0)
+                else:
+                    pts = 25
+                    msg = (f"卖盘深度骤增 {surge_pct:.1f}%（当前 {current_ask:,.0f} "
+                           f"vs 均值 {avg_ask:,.0f} 股），大卖单涌入 [+{pts}分]")
+                    score += pts
+                    signals.append(msg)
+                    db_save_signal(conn, "SHORT_ASK_SURGE", msg, pts)
             elif surge_pct >= SHORT_ASK_SURGE_PCT * 0.5:
-                pts = 12
-                msg = f"卖盘深度明显上升 {surge_pct:.1f}% [+{pts}分]"
-                score += pts
-                signals.append(msg)
+                if trap_suspect:
+                    msg = (f"⚠ 卖盘上升 {surge_pct:.1f}% 但摆盘偏多 "
+                           f"{current_imbalance:+.3f}，疑似诱空，不计分")
+                    signals.append(msg)
+                else:
+                    pts = 12
+                    msg = f"卖盘深度明显上升 {surge_pct:.1f}% [+{pts}分]"
+                    score += pts
+                    signals.append(msg)
 
     # ── 维度 3：摆盘持续偏空 ───────────────────────────────
     imb_rows = conn.execute(
@@ -915,6 +944,14 @@ def analyze_short_entry(
         sig_type = "CAUTION"
     else:
         sig_type = "HOLD"
+
+    # ── Failsafe：摆盘明显偏多时强制降级（防底部追空）──────
+    if sig_type == "ENTRY" and current_imbalance > SHORT_TRAP_IMB_BLOCK:
+        signals.append(
+            f"⚠ 摆盘失衡度 {current_imbalance:+.3f} 明显偏多（>{SHORT_TRAP_IMB_BLOCK}），"
+            f"买盘强势，ENTRY 降级为 CAUTION 防诱空"
+        )
+        sig_type = "CAUTION"
 
     return score, sig_type, signals
 
@@ -987,7 +1024,7 @@ def analyze_short_exit(
 
 
 # ═══════════════════════════════════════════════════════════
-# 九、综合评分与仪表盘
+# 十、综合评分与仪表盘
 # ═══════════════════════════════════════════════════════════
 
 # ── 持仓模型（手动建仓，命令行传入）────────────────────────
@@ -1161,6 +1198,7 @@ class MonitorState:
     momentum_ratio:    Optional[float] = None   # 卖空动能比
     volume_surge:      Optional[float] = None   # 卖空量爆量比
     in_position:       bool            = False     # 手动标记是否持有空仓
+    recent_squeeze_scores: list[int]   = field(default_factory=list)  # 近 N 轮逼空评分（最旧在前）
 
 
 def print_dashboard(
@@ -1275,7 +1313,7 @@ def print_dashboard(
 
 
 # ═══════════════════════════════════════════════════════════
-# 九、主监控循环
+# 十一、主监控循环
 # ═══════════════════════════════════════════════════════════
 def run_monitor(held_short: Optional[HeldShort] = None):
     if held_short:
@@ -1344,19 +1382,30 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             squeeze_score   = min(s1 + s2 + s3 + hkex_squeeze_risk, 100)
             squeeze_signals = sg1 + sg2 + sg3 + [s for s in hkex_sigs if "逼空" in s or "亏损" in s]
 
+            # ── 维护近 N 轮逼空评分历史（供做空安全门取峰值）─────
+            state.recent_squeeze_scores.append(squeeze_score)
+            if len(state.recent_squeeze_scores) > SHORT_SQUEEZE_LOOKBACK:
+                state.recent_squeeze_scores = \
+                    state.recent_squeeze_scores[-SHORT_SQUEEZE_LOOKBACK:]
+            recent_max_squeeze = max(state.recent_squeeze_scores)
+
             # ── 做空入场评分（HKEX 动能分叠加）──────────────────
             short_score, short_signal, short_sigs = analyze_short_entry(
                 conn, squeeze_score,
                 state.last_price,
                 state.latest_ask_depth or 0,
                 state.latest_imbalance or 0,
+                recent_max_squeeze=recent_max_squeeze,
             )
             short_score = min(short_score + hkex_support, 100)
             short_sigs  = short_sigs + [s for s in hkex_sigs if "支撑做空" in s]
-            if short_score >= SHORT_ENTRY_MIN:
-                short_signal = "ENTRY"
-            elif short_score >= int(SHORT_ENTRY_MIN * 0.6) and short_signal == "HOLD":
-                short_signal = "CAUTION"
+            # 仅在 HOLD 时根据 HKEX 叠加分升级；BLOCKED/CAUTION 由 analyze_short_entry
+            # 内的安全门和 failsafe 决定，不允许在此被覆盖回 ENTRY，避免诱空陷阱。
+            if short_signal == "HOLD":
+                if short_score >= SHORT_ENTRY_MIN:
+                    short_signal = "ENTRY"
+                elif short_score >= int(SHORT_ENTRY_MIN * 0.6):
+                    short_signal = "CAUTION"
             state.short_score  = short_score
             state.short_signal = short_signal
 
@@ -1421,7 +1470,7 @@ def run_monitor(held_short: Optional[HeldShort] = None):
 
 
 # ═══════════════════════════════════════════════════════════
-# 十、辅助命令
+# 十二、辅助命令
 # ═══════════════════════════════════════════════════════════
 def cmd_signals(n: int = 30):
     """打印最近 n 条信号记录。"""

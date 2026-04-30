@@ -6,10 +6,10 @@ MINIMAX-W (HK.00100) 模拟账户自动做空交易机器人
 基于 short_squeeze_monitor.py 的信号引擎，在富途模拟 MARGIN 账户上自动下单。
 
 入场规则（4 条件全满足）：
-    1. 做空入场评分 ≥ 60 monitor 对齐）
-    2. 连续 1 轮维持 ENTRY 信号（15s 轮询下足够过滤噪声）
-    3. 逼空评分 < 20 monitor 对齐）
-    4. 摆盘失衡度 < +0.60（ENTRY_IMB_THRESHOLD）— 排除订单簿极度偏多的情况
+    1. 做空入场评分 ≥ HIGH_ENTRY_SCORE（默认 60，可热更新）
+    2. 连续 ENTRY_CONFIRM_ROUNDS 轮维持 ENTRY 信号（默认 1 轮 = 15s）
+    3. 逼空评分 < SAFE_SQUEEZE_SCORE（默认 20）
+    4. 摆盘失衡度 < ENTRY_IMB_THRESHOLD（默认 0.60）— 排除订单簿极度偏多的情况
 
 仓位管理：
     · 评分 65–74 → 开仓 50%（HALF_QTY = 500 股）
@@ -90,14 +90,9 @@ STOCK_NAME    = STOCKS[DEFAULT_STOCK]["name"]
 OPEND_HOST    = "127.0.0.1"
 OPEND_PORT    = 11111
 
-# ── 账户配置（切换实盘只需改这三行）────────────────────────
-# 模拟账户（OPTION类型，不支持港股做空，已停用）
-# SIM_ACC_ID = 18982257
-# SIM_ENV    = TrdEnv.SIMULATE
-# SIM_MARKET = TrdMarket.HK
-# SIM_FIRM   = None
-
-# 实盘账户
+# ── 账户配置（变量名沿用 SIM_ 前缀，保留以便兼容旧代码引用）──
+# 当前为实盘账户；切换模拟时改这四行：
+#   SIM_ENV = TrdEnv.SIMULATE; SIM_FIRM = None; SIM_ACC_ID = <模拟acc_id>
 SIM_ACC_ID = 281756478968301696
 SIM_ENV    = TrdEnv.REAL
 SIM_MARKET = TrdMarket.HK
@@ -113,11 +108,11 @@ _LOG_DATE  = datetime.date.today().strftime("%Y%m%d")
 TRADER_LOG = _os.path.join(_LOG_DIR, f"paper_trader_{_LOG_DATE}.log")
 _os.makedirs(_LOG_DIR, exist_ok=True)
 
-# ── 入场条件 ──────────────────────────────────────────────
-HIGH_ENTRY_SCORE    = 60              # 最低入场评分（与 short_squeeze_monitor.py 的 SHORT_ENTRY_MIN 一致）
-SAFE_SQUEEZE_SCORE  = 20             # 最大允许逼空评分（与 monitor 的 SHORT_SAFE_SQUEEZE 一致）
-ENTRY_IMB_THRESHOLD = 0.60           # 失衡度低于此值才允许入场（排除极度偏多）
-ENTRY_CONFIRM_ROUNDS = 1             # 连续 ENTRY 信号轮数（15s 轮询下 1 轮 = 15s 确认，窗口够用）
+# ── 入场条件（可被 config/trader_config.json 热更新覆盖）────
+HIGH_ENTRY_SCORE    = 60                  # 最低入场评分（trader 自身阈值，比 monitor 的 SHORT_ENTRY_MIN=55 更严格）
+SAFE_SQUEEZE_SCORE  = 20                  # 最大允许逼空评分（trader 自身阈值，比 monitor 的 SHORT_SAFE_SQUEEZE=25 更严格）
+ENTRY_IMB_THRESHOLD = 0.60                # 失衡度低于此值才允许入场（排除极度偏多）
+ENTRY_CONFIRM_ROUNDS = 1                  # 连续 ENTRY 信号轮数（15s 轮询下 1 轮 = 15s 确认）
 CLOSE_GUARD_TIME = datetime.time(15, 50)  # 此时间后禁止开新仓（HKT）
 
 # ── 仓位管理 ──────────────────────────────────────────────

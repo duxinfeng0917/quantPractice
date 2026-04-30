@@ -2733,3 +2733,65 @@ bash start.sh trader --qty 100
 
 追加 2026-04-20 续对话记录至 `CONVERSATION_LOG.md`，涵盖：模拟账户限制根因分析（OPTION账户不支持股票订单、CASH账户无融券）、客服回复解读、当前系统状态确认（实盘账户已配置、配置已回归生产值）。
 
+---
+
+## Q12. 用户
+> 2026-04-30
+
+分析日志，687 的时候发出做空入场信号是否正常？（贴出 09:43:04–09:45:50 一段实盘 dashboard 日志）
+
+---
+
+### 助手回复
+
+**结论：不正常，是典型的"底部追空"陷阱**。
+
+复盘走势：09:43:19 价格 688.5 首次触发 ENTRY=63 → 09:43:34 顶点 88（价格 687.5）→ 09:43:49 价格最低 686.5 仍 78 ENTRY → 09:44:35 价格已反弹至 690（BLOCKED，逼空=43）→ 09:45:35 反弹至 696.5（+9 港元，+1.4%）。若按 687 入场 1000 股，1 分钟内浮亏约 -9000 港元，方向完全错误。
+
+定位三处逻辑漏洞：
+1. **「卖盘深度骤增 +25 分」是反向信号**：13,420 股大卖单计为做空利好，但下一轮立即降到 1,720 股（撤单 -77%），是挂大卖单制造空头跟风后撤单拉升的逼空套路。
+2. **逼空安全门被均值滑动稀释**：09:43:04 squeeze=43 BLOCKED → 09:43:19 突然降到 18 PASS，原因是新 8,540 股大卖单把 ASK 均值拉高，骤减信号自动失效。同时摆盘失衡度 +0.451（明显偏多）这一红旗被 `analyze_short_entry` 维度 3 忽略（只检查偏空）。
+3. **HKEX 叠加分覆盖 failsafe**：`run_monitor` 末段无条件 `if short_score >= 55: short_signal = "ENTRY"` 会把内部刚降级的 CAUTION/BLOCKED 升回 ENTRY。
+
+---
+
+## Q13. 用户
+> 2026-04-30
+
+帮我修复
+
+---
+
+### 助手回复
+
+实施 3 项修复并通过语法检查：
+
+**`short_squeeze_monitor.py`**
+- 新增 3 常量：`SHORT_SQUEEZE_LOOKBACK=4`、`SHORT_TRAP_IMB_BLOCK=0.30`、`SHORT_TRAP_IMB_SUPPRESS=0.10`。
+- `analyze_short_entry` 签名加 `recent_max_squeeze`：安全门用 `max(squeeze_score, recent_max_squeeze)`，避免均值滑动稀释一次性绕过。
+- 维度 2 加诱空检测：`current_imbalance > +0.10` 时卖盘骤增不计 +25 分，输出 ⚠ 提示并记 `SHORT_ASK_SURGE_TRAP` 信号入库。
+- 评分末尾加 failsafe：ENTRY 且 `imbalance > +0.30` → 强制降级 CAUTION。
+- `MonitorState.recent_squeeze_scores: list[int]` 滑动窗口字段；`run_monitor` 每轮 append、截断到 N 轮、传 max 给 `analyze_short_entry`。
+- `run_monitor` 末段升级逻辑改成只在 `short_signal == "HOLD"` 时根据叠加分升级，禁止覆盖 BLOCKED/CAUTION。
+
+**`docs/DEVLOG.md`** — 新增"迭代十：底部追空陷阱修复（2026-04-30）"，含背景、复盘、变更、回归验证、决策理由。
+
+**内存** — `signal_thresholds.md` 加诱空保护表格、`known_bugs_and_gotchas.md` 加 Bug 6。
+
+回归验证（基于原日志）：09:43:19 由 ENTRY=63 → BLOCKED（recent_max=43>25）；09:43:34/49/04/19 由于 imbalance 全部 > +0.10，维度 2 +25 分被吞掉，加 failsafe 在 imbalance > +0.30 时降级 CAUTION，整段不再触发 ENTRY。
+
+**决策理由**：优先用"摆盘失衡度方向"判别诱空，而非"卖盘持续性"。后者无法识别本案——09:43:34 起 5 轮卖盘都维持 12k+ 股，持续性检查同样会通过。失衡度直接反映买卖双方真实力量对比，对挂单撤单套路免疫。
+
+---
+
+## Q14. 用户
+> 2026-04-30
+
+更新对话记录
+
+---
+
+### 助手回复
+
+追加 2026-04-30 对话记录（Q12–Q14）至 `CONVERSATION_LOG.md`，涵盖：底部追空日志诊断（686.5 局部低点 ENTRY=88 后 1 分钟反弹 +1.4%）、三处逻辑漏洞定位（反向信号、均值滑动稀释、HKEX 叠加分覆盖 failsafe）、迭代十修复实施（3 常量 + recent_max_squeeze + 维度 2 诱空检测 + ENTRY failsafe + run_monitor 升级逻辑收紧）。
+

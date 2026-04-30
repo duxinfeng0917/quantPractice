@@ -790,4 +790,31 @@ python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000 --stop-pct 3.5
 
 **决策理由：** 选择函数属性而非 `MonitorState` 字段，原因是缓存只与 `fetch_capital_flow` 的私有去重逻辑相关，调用方仍能像之前一样把返回 dict 直接赋给 `state.latest_big_net`，不需要感知去重机制。返回缓存 dict 而非 `None` 是为了不破坏 `state.latest_big_net = cf["big_net"]` 的现有写法。
 
-*本文档记录截止：2026-04-28。*
+---
+
+## 迭代十：底部追空陷阱修复（2026-04-30）
+
+**背景：** 2026-04-30 09:43–09:44 一段实盘日志中，价格于 686.5–688.5 区间被打出 ENTRY 信号（做空评分一度高达 88），随后 1 分钟内反弹至 696.5（+1.4%），属于典型"底部追空"。复盘发现三处逻辑漏洞：
+
+1. **「卖盘深度骤增 +25 分」是反向信号**：[`analyze_short_entry`](short_squeeze_monitor.py) 维度 2 把 13,420 股大卖单计为做空利好 +25 分，但下一轮卖盘骤减到 1,720 股（-77%）——这是"挂大卖单制造空头跟风、瞬间撤单拉升"的逼空套路，方向恰好相反。
+2. **逼空安全门被均值滑动稀释**：09:43:04 时逼空=43（BLOCKED），09:43:19 突然降到 18（PASS），原因是新出现的 8,540 股大卖单把 `ASK_DEPTH_WINDOW` 均值拉高，骤减信号自动失效；与此同时摆盘失衡度 +0.451 明显偏多（红旗）却被忽略。
+3. **HKEX 叠加分覆盖 failsafe**：`run_monitor` 末段无条件 `if short_score >= SHORT_ENTRY_MIN: short_signal = "ENTRY"`，会把 `analyze_short_entry` 内部刚降级的 CAUTION/BLOCKED 重新升回 ENTRY。
+
+**变更内容：**
+- `short_squeeze_monitor.py` 新增三个常量：
+  - `SHORT_SQUEEZE_LOOKBACK = 4` — 逼空安全门回看 N 轮（取峰值）
+  - `SHORT_TRAP_IMB_BLOCK = 0.30` — 摆盘失衡度阈值，超过即降级
+  - `SHORT_TRAP_IMB_SUPPRESS = 0.10` — 卖盘骤增时若失衡度 > 此值，不计 +25 分
+- `analyze_short_entry` 签名新增 `recent_max_squeeze`：安全门用 `max(squeeze_score, recent_max_squeeze)`，避免被均值滑动稀释一次性绕过。
+- 维度 2 加入诱空检测：当 `current_imbalance > SHORT_TRAP_IMB_SUPPRESS` 且卖盘骤增时，输出"⚠ 疑似诱空挂单"提示但**不计分**，并记录 `SHORT_ASK_SURGE_TRAP` 类型信号入库。
+- 评分末尾加 failsafe：`sig_type == "ENTRY"` 且 `current_imbalance > SHORT_TRAP_IMB_BLOCK` → 强制降级 CAUTION。
+- `MonitorState.recent_squeeze_scores: list[int]` 滑动窗口字段；`run_monitor` 每轮 append 当前 squeeze_score，截断到 N 轮，传 max 给 `analyze_short_entry`。
+- `run_monitor` 末段升级逻辑改为只在 `short_signal == "HOLD"` 时根据叠加分升级，禁止覆盖 BLOCKED/CAUTION。
+
+**回归验证（基于 09:43–09:44 日志）：**
+- 09:43:19：recent_max_squeeze = max(43, 18) = 43 > 25 → BLOCKED ✓
+- 09:43:34/49/04/19：current_imbalance 在 +0.276 ~ +0.451 区间，全部 > +0.10，维度 2 +25 分被诱空检测吞掉；即便分数勉强 ≥55，imbalance > +0.30 时由 failsafe 降级 CAUTION。
+
+**决策理由：** 优先用"摆盘失衡度方向"判别诱空，而非依赖"卖盘持续性"。后者无法识别本案——09:43:34 起 5 轮卖盘都维持在 12k+ 股，持续性检查同样会通过。摆盘失衡度直接反映买卖双方真实力量对比，对挂单撤单套路免疫。
+
+*本文档记录截止：2026-04-30。*
