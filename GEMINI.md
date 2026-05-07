@@ -5,7 +5,7 @@ This project is a quantitative trading tool for Hong Kong stock **short-selling 
 ## Project Overview
 
 - **Purpose**: Identify short-squeeze risks and short-selling opportunities for HK stocks using four proxy signals (HKEX ordinary account has no direct access to borrow rates or lending pool).
-- **Supported Stocks**: Configurable via `shared_config.py`; currently `00100` (MINIMAX-W) and `02513` (质谱). Add new stocks by appending to the `STOCKS` dict.
+- **Supported Stocks**: Configurable via `shared_config.py`; currently `00100` (MINIMAX-W) and `02513` (智谱AI). Add new stocks by appending to the `STOCKS` dict.
 - **Main Technologies**:
   - **Python 3.11+**: Core logic and data processing.
   - **Futu OpenD API**: Real-time market data (Level 2 quotes, capital distribution).

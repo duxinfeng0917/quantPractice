@@ -20,12 +20,12 @@ STOCKS: dict = {
         "db_path":       "short_data.db",
         "poll_interval": 15,            # 实时轮询间隔（秒）
     },
-    # "02513": {
-    #     "symbol":        "HK.02513",
-    #     "stock_code":    "02513",
-    #     "name":          "质谱",
-    #     "db_path":       "short_data_02513.db",
-    #     "poll_interval": 60,
-    # },
+    "02513": {
+        "symbol":        "HK.02513",
+        "stock_code":    "02513",
+        "name":          "智谱AI",
+        "db_path":       "short_data_02513.db",
+        "poll_interval": 60,
+    },
 }
 DEFAULT_STOCK = "00100"

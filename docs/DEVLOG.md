@@ -817,4 +817,29 @@ python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000 --stop-pct 3.5
 
 **决策理由：** 优先用"摆盘失衡度方向"判别诱空，而非依赖"卖盘持续性"。后者无法识别本案——09:43:34 起 5 轮卖盘都维持在 12k+ 股，持续性检查同样会通过。摆盘失衡度直接反映买卖双方真实力量对比，对挂单撤单套路免疫。
 
-*本文档记录截止：2026-04-30。*
+## 迭代十一：警报噪音治理 — 自喂养基准 / 复刻评分 / 文案常量化（2026-05-07）
+
+**背景：** 2026-05-07 13:47–13:49 一段实盘日志中，dashboard 在 8 个连续 polling 周期里反复打出"卖盘深度骤减 +25 分"和"大单净流入持续正值 2 轮 +10 分"，逼空评分卡在 65/73 高位约 2 分钟。复盘三处问题：
+
+1. **`ASK_DEPTH_WINDOW=20` × 15s = 5 分钟太短**，且 `analyze_order_book` 用算术均值作为基准。新出现的低深度样本会被一并塞进窗口、连续把均值拽下，形成"基准追低值"的自喂养循环：均值从 1,659 → 1,196 一路掉，警报却始终显示 30%+ 骤减，每轮重复 +25 分。
+2. **「持续正值 2 轮」文案永远写 2 轮**——直接用了常量 `BIGFLOW_REVERSAL_MIN`，没追踪真实连续轮数；连续 30 轮和连续 2 轮看起来一模一样。
+3. **Futu `get_capital_distribution` 约 1 分钟才刷新**，`fetch_capital_flow` 已按 `update_time` 去重 DB 写入，但 `analyze_capital_flow` 每 15s 仍读同一窗口、再次落 +10 分到 dashboard，dashboard 出现 4 倍假"事件"密度。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- 新增常量 `ASK_DEPTH_LOG_COOLDOWN_SECS = 60`；`ASK_DEPTH_WINDOW` 由 20 → 60（≈15 分钟）。
+- `analyze_order_book`：基准由 `statistics.mean` 改为 `statistics.median`（对极端低值鲁棒）；`log.warning` + 通过函数静态属性 `_last_log_ts` 实现 60s 节流；评分仍每轮计算（评分 = 当前状态，不能被冷却抑制）。
+- `analyze_short_entry` 维度 2 同步改用中位数（与 `analyze_order_book` 保持基准一致），`analyze_short_exit` 设计意图是持仓时短窗口快速反应（5 样本），保留均值。
+- `analyze_capital_flow`：循环计算真实 `streak`（最新往前数连续 `> 0` 轮数）；持续正值按 streak 长度分档（≥2: +5, ≥4: +10, ≥8: +15）；反转信号文案也改用真实 streak。
+- `analyze_capital_flow`：函数入口查 `capital_flow` 表最新 `id`，与函数静态属性 `_last_id` 比对相等则直接返回缓存的 `(score, signals)`，避免同一份数据反复评分。
+
+**未改动（已正确）：** `db_save_signal` 已具备 300s 冷却机制（v2 引入），DB 信号表不会因高频报警重复写入。
+
+**回归验证（手工心算 13:47-13:49 日志）：**
+- 中位数基准：在 8 轮 ask_depth ∈ [240, 860] 的样本中位数会更接近 600 而非 1,200；`shrink_pct` 大约 0–30%，多数 polling 周期不会再触发 +25 分。
+- streak 文案：当 capital flow 实际连续正值 N 轮时，dashboard 准确显示 N 而非常量 2。
+- 资金流复用：3 分钟内同一 `capital_flow.id` 会让 `analyze_capital_flow` 直接返回缓存，dashboard 不再每轮重新打"+10 分"。
+
+**决策理由：** 把"评分"和"日志/dashboard 事件"解耦——评分必须每轮真实反映当前观测，但用户感知的"事件"应只在状态变化时触发。中位数基准比扩大窗口更便宜：保留 5 分钟窗口也能用，但 15 分钟+中位数对真正长时间的薄盘期更鲁棒。
+
+*本文档记录截止：2026-05-07。*

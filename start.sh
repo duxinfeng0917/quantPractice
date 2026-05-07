@@ -19,7 +19,7 @@
 #   bash start.sh log [monitor|trader]         # 实时查看日志（tail -f）
 #
 # 示例（多股票）：
-#   STOCK=02513 bash start.sh all --dry-run    # 质谱 dry-run
+#   STOCK=02513 bash start.sh all --dry-run    # 智谱AI dry-run
 #   STOCK=00100 bash start.sh all              # MINIMAX-W 正式启动
 # ============================================================
 
@@ -172,8 +172,8 @@ case "${1:-}" in
     echo ""
     echo "示例:"
     echo "  bash start.sh all                          # 00100 一键启动"
-    echo "  STOCK=02513 bash start.sh all              # 质谱 一键启动"
-    echo "  STOCK=02513 bash start.sh all --dry-run    # 质谱 测试模式"
+    echo "  STOCK=02513 bash start.sh all              # 智谱AI 一键启动"
+    echo "  STOCK=02513 bash start.sh all --dry-run    # 智谱AI 测试模式"
     echo "  bash start.sh all --dry-run                # 00100 测试模式"
     echo "  bash start.sh log monitor                  # 实时监控日志"
     echo "  bash start.sh stop                         # 停止当前股票"

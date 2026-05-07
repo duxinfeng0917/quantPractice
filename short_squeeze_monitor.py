@@ -58,8 +58,9 @@ DB_PATH = STOCKS[DEFAULT_STOCK]["db_path"]
 # 逼空信号阈值
 SHORT_RATIO_WINDOW   = 5          # 卖空占比趋势回看天数
 SHORT_RATIO_RISE_MIN = 3          # 连续上升至少 N 天后才判断为"高位"
-ASK_DEPTH_SHRINK_PCT = 30.0       # 卖盘深度较近期均值下降超过此值 → 触发信号（%）
-ASK_DEPTH_WINDOW     = 20         # 卖盘深度滚动均值窗口（轮次）
+ASK_DEPTH_SHRINK_PCT = 30.0       # 卖盘深度较近期基准下降超过此值 → 触发信号（%）
+ASK_DEPTH_WINDOW     = 60         # 卖盘深度滚动基准窗口（轮次，15s × 60 ≈ 15 分钟）
+ASK_DEPTH_LOG_COOLDOWN_SECS = 60  # 同一深度骤减事件的 WARNING 日志/dashboard signal 冷却（秒）
 BIGFLOW_REVERSAL_MIN = 2          # 大单净流入连续正值 N 轮 → 触发反转信号
 BIGFLOW_WINDOW       = 10         # 大单净流入趋势窗口（轮次）
 
@@ -455,10 +456,24 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
     大单净流入逼空信号检测：
     - 连续 BIGFLOW_REVERSAL_MIN 轮 big_net > 0，且此前有负值 → 反转信号
     - 大单净流入持续放大 → 加速信号
+
+    Futu 资金流约每分钟才刷新；fetch_capital_flow 已按 update_time 去重。
+    若 capital_flow 表自上次评分后没有新行，直接复用上一轮的 score/signals，
+    避免同一份数据被反复打分、产生 dashboard 噪音。
     """
+    latest_id_row = conn.execute(
+        "SELECT id FROM capital_flow ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    latest_id = latest_id_row[0] if latest_id_row else None
+    if latest_id is not None and getattr(analyze_capital_flow, "_last_id", None) == latest_id:
+        return getattr(analyze_capital_flow, "_last_result", (0, []))
+
     history = db_get_recent_big_net(conn, BIGFLOW_WINDOW)
     if len(history) < BIGFLOW_REVERSAL_MIN + 1:
-        return 0, []
+        result = (0, [])
+        analyze_capital_flow._last_id = latest_id
+        analyze_capital_flow._last_result = result
+        return result
 
     score = 0
     signals: list[str] = []
@@ -469,10 +484,18 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
     all_recent_positive  = all(v > 0 for v in recent)
     had_earlier_negative = any(v < 0 for v in earlier)
 
+    # 计算实际连续正值轮数（从最新往前数）
+    streak = 0
+    for v in history:
+        if v > 0:
+            streak += 1
+        else:
+            break
+
     if all_recent_positive and had_earlier_negative:
         pts = 25
         total_inflow = recent[0] / 10000   # 取最新累计值（日内累计额，不应叠加多轮）
-        msg = (f"大单净流入反转：连续 {BIGFLOW_REVERSAL_MIN} 轮正值 "
+        msg = (f"大单净流入反转：连续 {streak} 轮正值 "
                f"当前累计 {total_inflow:+,.1f} 万港元 [+{pts}分]")
         score += pts
         signals.append(msg)
@@ -480,9 +503,14 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
         db_save_signal(conn, "BIG_FLOW_REVERSAL", msg, pts)
 
     elif all_recent_positive:
-        # 持续净流入但未经历负值阶段，温和加分
-        pts = 10
-        msg = f"大单净流入持续正值 {BIGFLOW_REVERSAL_MIN} 轮 [+{pts}分]"
+        # 持续净流入但未经历负值阶段，按 streak 长度分档
+        if streak >= 8:
+            pts = 15
+        elif streak >= 4:
+            pts = 10
+        else:
+            pts = 5
+        msg = f"大单净流入持续正值 {streak} 轮 [+{pts}分]"
         score += pts
         signals.append(msg)
 
@@ -495,7 +523,10 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
             score += pts
             signals.append(msg)
 
-    return score, signals
+    result = (score, signals)
+    analyze_capital_flow._last_id = latest_id
+    analyze_capital_flow._last_result = result
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -531,24 +562,34 @@ def analyze_order_book(conn: sqlite3.Connection,
                         current_ask: float) -> tuple[int, list[str]]:
     """
     卖盘深度骤减信号：
-    - 当前 ask_depth 比近期均值下降超过 ASK_DEPTH_SHRINK_PCT% → 空头回补/做空意愿减弱
+    - 当前 ask_depth 较近期基准（中位数）下降超过 ASK_DEPTH_SHRINK_PCT% → 空头回补/做空意愿减弱
     - 买盘深度 > 卖盘深度（正失衡）→ 多头主动接盘
+
+    基准用中位数（而非均值）以避免连续低值样本把均值拉下、形成自喂养警报。
+    日志/dashboard signal 受 ASK_DEPTH_LOG_COOLDOWN_SECS 节流；评分仍每轮计算
+    （评分代表当前状态，不应被冷却抑制）。
     """
     history = db_get_recent_ask_depth(conn, ASK_DEPTH_WINDOW)
     score = 0
     signals: list[str] = []
 
     if len(history) >= 5 and current_ask > 0:
-        avg_ask = statistics.mean(history[1:])   # 排除刚存入的当前值，与 analyze_short_entry 保持一致
-        if avg_ask > 0:
-            shrink_pct = (avg_ask - current_ask) / avg_ask * 100
+        # 排除刚存入的当前值，与 analyze_short_entry 保持一致；中位数对极端低值鲁棒
+        baseline = statistics.median(history[1:])
+        if baseline > 0:
+            shrink_pct = (baseline - current_ask) / baseline * 100
+            now_ts = time.time()
+            last_log_ts = getattr(analyze_order_book, "_last_log_ts", 0.0)
+            should_log = (now_ts - last_log_ts) >= ASK_DEPTH_LOG_COOLDOWN_SECS
             if shrink_pct >= ASK_DEPTH_SHRINK_PCT:
                 pts = 25
                 msg = (f"卖盘深度骤减 {shrink_pct:.1f}% "
-                       f"(当前 {current_ask:,.0f} vs 均值 {avg_ask:,.0f} 股) [+{pts}分]")
+                       f"(当前 {current_ask:,.0f} vs 基准 {baseline:,.0f} 股) [+{pts}分]")
                 score += pts
                 signals.append(msg)
-                log.warning(f"[摆盘预警] {msg}")
+                if should_log:
+                    log.warning(f"[摆盘预警] {msg}")
+                    analyze_order_book._last_log_ts = now_ts
                 db_save_signal(conn, "ASK_DEPTH_SHRINK", msg, pts)
             elif shrink_pct >= ASK_DEPTH_SHRINK_PCT * 0.6:
                 pts = 12
@@ -856,7 +897,7 @@ def analyze_short_entry(
     # ── 维度 2：卖盘深度骤增（大卖单出现）──────────────────
     ask_history = db_get_recent_ask_depth(conn, ASK_DEPTH_WINDOW)
     if len(ask_history) >= 5 and current_ask > 0:
-        avg_ask = statistics.mean(ask_history[1:])   # 排除当前轮
+        avg_ask = statistics.median(ask_history[1:])   # 排除当前轮，与 analyze_order_book 一致
         if avg_ask > 0:
             surge_pct = (current_ask - avg_ask) / avg_ask * 100
             # 诱空检测：卖盘骤增但摆盘仍明显偏多 → 大卖单与买盘强势同时存在，
