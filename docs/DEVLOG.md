@@ -842,4 +842,112 @@ python3 short_squeeze_monitor.py --held-short 865 --held-qty 1000 --stop-pct 3.5
 
 **决策理由：** 把"评分"和"日志/dashboard 事件"解耦——评分必须每轮真实反映当前观测，但用户感知的"事件"应只在状态变化时触发。中位数基准比扩大窗口更便宜：保留 5 分钟窗口也能用，但 15 分钟+中位数对真正长时间的薄盘期更鲁棒。
 
-*本文档记录截止：2026-05-07。*
+## 迭代十二：高点基准漂移 / 持续正值底分降权（2026-05-12）
+
+**背景：** 2026-05-12 09:30–09:40 一段实盘日志中暴露两个失真：
+
+1. **维度 4「价格较近期高点下跌 X%」基准随价格漂移。** `recent_high = max(prices)` 取的是 `SHORT_PRICE_WINDOW=10` 滑动窗口内的最大值。当价格连续下跌时旧高点被滚出窗口，"高点"从 742.0 → 741.0 → 739.5 → 736.0 → 735.5 → 734.0 一路被价格自身拉低；累计跌幅 2%+ 的过程中 `drop_pct` 始终显示 ~0.95%，做空信号严重低估。同样的问题影响维度 5 的 `peak_idx`：peak 滑出窗口时整个 streak 重置（日志可见 6 轮 → 重置 → 2/3/3/4 轮）。
+2. **「持续正值 +15 分」成为逼空评分的常态底分。** `streak` 在 `BIGFLOW_WINDOW=10` 截断下永远显示 10 轮、加 15 分。逼空评分常态 15+ 起步、易触发 BLOCKED；但港股持续上行本不该等同于"逼空风险"。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- 新增 `db_get_session_high(conn, since_ts)` 辅助函数；查询 `price_history` 中 `ts >= since_ts` 的 `MAX(price)`。
+- `analyze_short_entry` 维度 4：`recent_high = max(prices)` → `session_high = db_get_session_high(conn, today.isoformat())`，anchor 不会随价格漂移；文案"较近期高点"改"较日内高点"。
+- `analyze_short_entry` 维度 5：用"最新连续下行 N 轮"替代"高点拒绝后连续下行"；从 `prices[-1]` 向回数 down ticks，与 peak 位置解耦，避免窗口滑动导致 streak 重置。
+- 新增常量 `BIGFLOW_STREAK_WINDOW = 120`；`analyze_capital_flow` 的 streak 计数改用此独立窗口（旧版本受 `BIGFLOW_WINDOW=10` 截断导致 streak 永远 ≤ 10）。
+- 持续正值分档降权：`>=2:+5, >=4:+10, >=8:+15` → `>=2:+3, >=4:+5, >=8:+8, >=16:+12`；纯持续不反转的顶格降到 +12，反转 + 持续仍给 +25。
+
+**回归验证（手工心算 09:30-09:40 日志）：**
+
+- 维度 4 anchor：今日 09:30 后 session high ≈ 742.0；09:33 价格 732.0 时 drop_pct 应约 1.35%（与日志显示一致），09:37 价格 730.0 时应约 1.62%（旧版仅显示 0.75%，因为窗口高点已被拉到 735.5）。
+- 维度 5 streak：09:32:42 价格序列 738.0 → 737.0 → 736.0 → 734.0 → 732.0 应给出 down_streak ≥ 4，不再因 peak_idx 滑出而重置。
+- BIGFLOW streak：09:30 起 streak 真实值若为 30 轮，文案应显示 30 轮（不再封顶 10）；分值 +12（旧版 +15）。
+- 逼空评分常态：纯持续正值（无反转、无加速、无摆盘连偏多）的最大贡献由 +15 降到 +12；与摆盘连偏多 +8 共存时常态从 23 降到 20，BLOCKED 触发门 25 不再被无脑顶到。
+
+**未改动（保留前迭代决策）：** 反转 + 持续仍给 +25 / `BIGFLOW_WINDOW=10` 用于反转判断（earlier 段需要负值历史）/ `analyze_short_exit` 持仓评分逻辑独立。
+
+**决策理由：** anchor 设计原则——任何"相对参照"（高点、基准、均值）都不能用滑动窗口的极值作为 anchor，否则在持续单向行情下 anchor 会被价格自身拉走，比较失真。streak 与 window 解耦同理：streak 是"事实"（真实连续轮数），window 是"判断条件"（够不够长），二者数学含义不同，混用一个常量造成数据失真。
+
+## 迭代十三：诱空陷阱二次治理 — 微小反转过滤 + 失衡度翻转检测（2026-05-12）
+
+**背景：** 2026-05-12 10:00:15 一段实盘日志（迭代十二上线后）暴露经典诱空场景：
+
+| 时刻 | 价格 | 事件 | 状态 |
+|---|---|---|---|
+| 09:59:14 | 724.0 | 卖盘骤减 30.8% → BLOCKED | BLOCKED |
+| 09:59:44 | 724.0 | BLOCKED 余威 | BLOCKED |
+| **10:00:15** | **718.0** | **资金 +252万→-15.8万 + 卖盘暴增 657% → ENTRY 88** | **ENTRY** |
+| 10:00:30 | 718.0 | ENTRY 86 | ENTRY |
+| 10:00:45 | 718.5 | ENTRY 98 | ENTRY |
+| 10:01:00 | 720.0 | 卖盘暴减 71% → CAUTION | CAUTION |
+| 10:01:16 | 720.5 | 资金回正 +104.9万 + 失衡 +0.831 → BLOCKED | BLOCKED |
+| 10:02:32 | **726.0** | 价格反弹回 ENTRY 上方 +1.1% | BLOCKED |
+
+ENTRY 持续 45 秒 → 立刻反转 → 价格 1.5 分钟反弹 +1.1%。`paper_trader.ENTRY_CONFIRM_ROUNDS=2`（30s）救不了；如按 ENTRY=98 入场会被套。
+
+复盘两个根因：
+
+1. **维度 1「大单净流入由正转负 +30 分」对微小波动过敏。** 累计 +252万 → -15.8万 实际变化只占峰值 6%，本质是噪音波动，但被当成完整反转加 +30。
+2. **失衡度高频翻转未识别为操纵特征。** 触发 ENTRY 前 6 轮 imbalance 序列：[+0.504, +0.379, +0.152, -0.315, +0.228, -0.277]——3 次极性翻转。这种"挂单—撤单—反向挂单"的博弈是主力诱空的特征，但触发 ENTRY 那一刻 imbalance=-0.277 偏空，所以原诱空保护（要求当下 imbalance > +0.10）失效。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- 新增常量：
+  - `SHORT_MICRO_REVERSAL_RATIO = 0.10` — 微小反转判定阈值
+  - `SHORT_IMB_FLIP_WINDOW = 6` / `SHORT_IMB_FLIP_MIN = 3` / `SHORT_IMB_FLIP_BAND = 0.10` — 失衡度翻转检测
+- 新增 `db_count_imb_flips(conn, n, neutral_band)` helper：统计最近 n 轮 imbalance 极性翻转次数，过滤 `|imb| ≤ band` 的中性轮避免 0 附近抖动误算
+- `analyze_short_entry` 维度 1：增加 `is_micro` 分支。`|latest_net| < max(earlier_net 正值) × ratio` 时只给 +5 分（带"⚠ 轻微转负 / 疑似噪音"文案），不计入 `SHORT_BIGFLOW_REVERSAL` DB 信号
+- `analyze_short_entry` Failsafe 2：`sig_type == "ENTRY"` 时调用 `db_count_imb_flips`，flips ≥ `SHORT_IMB_FLIP_MIN` 直接 `return 0, "BLOCKED", [reason]`，落入 DB 信号 `SHORT_IMB_FLIP_TRAP`
+
+**回归验证（手工心算 10:00:15 触发点）：**
+
+- 维度 1 微小反转：earlier_net 全部 +252 万；`|−15.8| / 252 = 6.3% < 10%` → micro，+5 分（旧 +30）
+- Failsafe 2 翻转计数：[+0.504, +0.379, +0.152, -0.315, +0.228, -0.277] 全部 |imb| > 0.10，符号 +++−+−，翻转 3 次 → ≥ `SHORT_IMB_FLIP_MIN` → BLOCKED
+- 即便没有 Failsafe 2，仅微小反转生效后该轮分值约 5+25+15+10 = 55，仍可能擦边 ENTRY；Failsafe 2 是关键安全网
+
+**未改动：** `SHORT_TRAP_IMB_SUPPRESS=0.10` 仍保护卖盘骤增遇当下偏多的诱空 / `SHORT_TRAP_IMB_BLOCK=0.30` 强制降级仍生效 / `SHORT_SQUEEZE_LOOKBACK=4` 维持。
+
+**决策理由：** 反转信号的"幅度"和"方向"都重要。仅看方向（正→负）会被微小波动触发；用 `|reversal| / 历史峰值` 比例过滤后，要求反转幅度有意义才打满分。失衡度翻转检测则是把"挂单博弈"这种时间序列特征显式建模——单点 imbalance 看不出操纵，6 轮内翻转 3 次的频率几乎只可能是主力对倒。
+
+## 迭代十四：逼空评分"日级地板"治理 — 安全门三元 AND 重构（2026-05-14）
+
+**背景：** 2026-05-14 09:42–09:45 一段实盘日志：MINIMAX-W 价格从 866.5 → 832（−4%，3 分钟），大单净流入 −3,742 万 → −5,023 万（持续放大流出），但做空入场评分始终 0、BLOCKED。逼空评分 63 / 71 / 88 / 96 循环出现，从未跌破安全线 25。复盘发现：
+
+| 信号 | 来源 | 性质 | 分 | 是否日内可变 |
+|---|---|---|---|---|
+| 卖空占比高位拐头 7.74→2.21% | `analyze_short_ratio_trend` | HKEX 日级 | +25 | 否（17:00 后更新） |
+| 价格高于 10 日成本线 (745) | `analyze_hkex_short_momentum` | HKEX 日级 | +20 | 几乎不 |
+| 价格高于 20 日成本线 (787.8) | 同上 | HKEX 日级 | +8 | 几乎不 |
+| 卖空动能比 0.40× 空头撤退中 | 同上 | HKEX 日级 | +10 | 否 |
+| **日级地板小计** | | | **63** | **整日固定** |
+
+63 分的"地板"把 `SHORT_SAFE_SQUEEZE=25` 永远焊死，无论日内行情如何下跌都无法清除。三个具体的逻辑缺陷：
+
+1. **「卖空动能比 < 0.6× 空头撤退中 +10 逼空风险」方向反了。** `momentum_ratio < 0.6` 表示今日卖空占比仅为 5 日均值 40%——空头**正在退场**。空头筹码减少 = 后续逼空燃料减少 = 逼空风险**下降**。当前代码加到 `squeeze_risk` 完全相反。
+2. **「卖空占比高位拐头 +25」缺少价格行为二阶确认。** 设计假设是"空头开始回补 → 推升股价 → 逼空启动"，但价格在跌时说明空头已清算完毕、行情进入下跌，根本不是逼空。
+3. **安全门是单维度阈值**——只看 `effective_squeeze > 25`，不看价格走向与资金流方向，无法被任何日内反向行情解锁。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- **Fix 1（[~L843](short_squeeze_monitor.py#L843)）：** `analyze_hkex_short_momentum` 中 `momentum_ratio < 0.6` 的 +10 由 `squeeze_risk` 改为 `short_support`，文案"[逼空风险+10分]"改"[支撑做空+10分]"。
+- **Fix 2（[~L661](short_squeeze_monitor.py#L661)）：** `analyze_short_ratio_trend` 返回签名 `(score, signals)` → `(score, support, signals)`。高位拐头计分前查 `db_get_recent_prices(SHORT_RATIO_PRICE_CONFIRM_WIN=30)`：若首尾价格 `last >= first`（价格上行/横盘），+25 仍计入 `score`；若 `last < first`（价格下行），+25 转入 `support`，DB 信号改用 `SHORT_RATIO_PEAK_BEARISH`。主循环 [~L1499](short_squeeze_monitor.py#L1499) 同步解包并把支撑信号文案分流到做空展示区。
+- **Fix 3（[~L937](short_squeeze_monitor.py#L937)）：** `analyze_short_entry` 的 BLOCKED 安全门从单维度阈值改为三元 AND——`effective_squeeze > SHORT_SAFE_SQUEEZE` 触发后再查：
+  - 价格确认下行：近 `SHORT_BLOCK_OVERRIDE_WIN=30` 轮首尾跌幅 ≥ `SHORT_BLOCK_PRICE_DROP_PCT=0.3%`
+  - 大单持续净流出：最新 `big_net ≤ SHORT_BLOCK_BIGFLOW_THRESHOLD=-3000 万 HKD` 且近 3 轮全部为负
+  
+  两项同时成立时**放行**（行情已确认下行，逼空假设被价格行为否定），日志打 `[安全门放行]` 并落 DB 信号 `SHORT_BLOCK_OVERRIDE`，继续走正常评分流程；否则维持原 BLOCKED 行为。
+
+- 新增常量：`SHORT_RATIO_PRICE_CONFIRM_WIN`、`SHORT_BLOCK_OVERRIDE_WIN`、`SHORT_BLOCK_PRICE_DROP_PCT`、`SHORT_BLOCK_BIGFLOW_THRESHOLD`。
+
+**回归验证（手工心算 2026-05-14 09:42–09:45 触发点）：**
+
+- Fix 1：动能比 0.40× 不再 +10 到逼空 → 日级地板从 63 降到 53。
+- Fix 2：09:42 段近 30 轮价格 866.5 → 832（−4%），符合下行确认；+25 高位拐头转入 short_support → 逼空进一步降到 28，且 `short_score` 加 25 分基础。
+- Fix 3：剩余逼空 28 仍超 25 → 进入放行判定。价格 −4% ≥ 0.3% 阈值；big_net = −5023 万 ≤ −3000 万阈值，近 3 轮均负 → **放行**。`analyze_short_entry` 进入维度评分。
+- 三处叠加后：维度 1（大单持续负 +15）+ 维度 4（session_high 跌幅 +15）+ 维度 5（连续下行 +10）+ s1_support（+25）+ hkex_support（动能 +10）≥ 55 → ENTRY 触发。
+
+**未改动（保留前迭代决策）：** `SHORT_SAFE_SQUEEZE=25` / `SHORT_SQUEEZE_LOOKBACK=4`（仍取窗口峰值）/ Failsafe 1（摆盘偏多降级）/ Failsafe 2（imbalance 翻转 BLOCKED）/ `SHORT_TRAP_IMB_SUPPRESS=0.10` / 微小反转过滤。
+
+**决策理由：** HKEX 日级静态信号（成本线、动能比、占比拐头）的价值是"环境分"，但不应该当作"日内不可变的逼空地板"使用。安全门需要让日内价格行为和资金流向有一票否决权——当行情已经证明逼空假设不成立时，安全门必须放行，否则就成了"宁可错过 100 个机会也不让一单进场"的设计缺陷。三元 AND 的语义是：只在"分高 + 行情未否定 + 资金未否定"三者同时成立时才拒绝入场。
+
+*本文档记录截止：2026-05-14。*

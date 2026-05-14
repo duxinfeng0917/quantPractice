@@ -27,5 +27,12 @@ STOCKS: dict = {
         "db_path":       "short_data_02513.db",
         "poll_interval": 60,
     },
+    "06082": {
+        "symbol":        "HK.06082",
+        "stock_code":    "06082",
+        "name":          "壁仞科技",
+        "db_path":       "short_data_06082.db",
+        "poll_interval": 30,
+    },
 }
 DEFAULT_STOCK = "00100"
