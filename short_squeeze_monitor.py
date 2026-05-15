@@ -55,11 +55,20 @@ HKEX_FETCH_HOUR   = 17            # 每日几点后拉取 HKEX 数据（港股 1
 
 DB_PATH = STOCKS[DEFAULT_STOCK]["db_path"]
 
+# 港股连续交易时段（不含开盘/收盘集合竞价），仅在此区间打分
+# 09:00-09:30 开盘集合竞价、12:00-13:00 午休、16:00-16:10 收盘集合竞价均跳过
+HK_TRADING_SESSIONS = [
+    (datetime.time(9, 30),  datetime.time(12, 0)),
+    (datetime.time(13, 0),  datetime.time(16, 0)),
+]
+STALE_DATA_ROUNDS = 5             # 价格+大单累计连续 N 轮未变 → 视为数据停滞，跳过打分
+
 # 逼空信号阈值
 SHORT_RATIO_WINDOW   = 5          # 卖空占比趋势回看天数
 SHORT_RATIO_RISE_MIN = 3          # 连续上升至少 N 天后才判断为"高位"
 ASK_DEPTH_SHRINK_PCT = 30.0       # 卖盘深度较近期基准下降超过此值 → 触发信号（%）
 ASK_DEPTH_WINDOW     = 60         # 卖盘深度滚动基准窗口（轮次，15s × 60 ≈ 15 分钟）
+ASK_DEPTH_SMOOTH_K   = 3          # 卖盘深度信号触发用近 K 轮中位数（过滤单次挂撤单噪音）
 ASK_DEPTH_LOG_COOLDOWN_SECS = 60  # 同一深度骤减事件的 WARNING 日志/dashboard signal 冷却（秒）
 BIGFLOW_REVERSAL_MIN = 2          # 大单净流入连续正值 N 轮 → 触发反转信号
 BIGFLOW_WINDOW       = 10         # 大单净流入反转/加速判断窗口（轮次）
@@ -82,8 +91,9 @@ SHORT_TRAP_IMB_BLOCK = 0.30       # 摆盘失衡度 > 此值 → 疑似诱空，
 SHORT_TRAP_IMB_SUPPRESS = 0.10    # 卖盘骤增时若摆盘失衡度 > 此值 → 不计 +25 分
 SHORT_MICRO_REVERSAL_RATIO = 0.10 # 维度1: |latest_net| < earlier 正值峰值 × 此比 → 微小反转，降权
 SHORT_IMB_FLIP_WINDOW = 6         # 失衡度极性翻转检测回看轮数
-SHORT_IMB_FLIP_MIN    = 3         # 近 N 轮翻转 ≥ 此值 → 视为挂单博弈，禁止 ENTRY
+SHORT_IMB_FLIP_MIN    = 2         # 近 N 轮翻转 ≥ 此值 → 视为挂单博弈，禁止 ENTRY
 SHORT_IMB_FLIP_BAND   = 0.10      # |imb| ≤ 此值视为中性轮，不参与翻转计数
+SHORT_IMB_SMOOTH_K    = 3         # trap_suspect 判定用近 K 轮失衡度中位数
 
 
 # ═══════════════════════════════════════════════════════════
@@ -285,17 +295,70 @@ def db_count_imb_flips(conn: sqlite3.Connection, n: int,
     统计最近 n 轮 orderbook_snapshots.imbalance 的极性翻转次数。
 
     |imb| ≤ neutral_band 的中性轮过滤掉（不参与翻转计数），避免在 0 附近抖动
-    被误算成翻转。返回值 0 表示稳定方向；≥3 通常意味着挂单博弈/操纵性信号。
+    被误算成翻转。返回值 0 表示稳定方向；≥2 通常意味着挂单博弈/操纵性信号。
+
+    Spike 过滤：单点孤立尖峰（v[i] 与左右邻居方向都相反）视为 1-tick 挂撤噪声，
+    从序列中剔除后再计数。否则一个孤立 spike 会贡献 2 次翻转（进入+离开），把
+    "实际只有 1 次摆盘异动" 误算为"高频博弈"，锁死真实信号 60s+（实盘 2026-05-15
+    14:13:43 → 14:14:29 案例：单个 +0.591 spike 把后续 60 秒清晰偏空信号全部 BLOCKED）。
     """
     rows = conn.execute(
         "SELECT imbalance FROM orderbook_snapshots ORDER BY id DESC LIMIT ?", (n,)
     ).fetchall()
     series = [r[0] for r in reversed(rows) if abs(r[0]) > neutral_band]
+
+    # 剔除孤立尖峰：a[i] 与两个邻居方向都相反 → 1-tick spike，不计入翻转
+    filtered: list[float] = []
+    for i, v in enumerate(series):
+        is_spike = (
+            0 < i < len(series) - 1
+            and (series[i - 1] > 0) != (v > 0)
+            and (series[i + 1] > 0) != (v > 0)
+        )
+        if not is_spike:
+            filtered.append(v)
+
     flips = 0
-    for i in range(1, len(series)):
-        if (series[i] > 0) != (series[i - 1] > 0):
+    for i in range(1, len(filtered)):
+        if (filtered[i] > 0) != (filtered[i - 1] > 0):
             flips += 1
     return flips
+
+
+# ═══════════════════════════════════════════════════════════
+# 三-B、交易时段判断
+# ═══════════════════════════════════════════════════════════
+def _is_trading_hours(now: datetime.datetime) -> bool:
+    """
+    判断当前是否在港股连续交易时段。
+    跳过：周末、盘前、开盘集合竞价、午休、收盘集合竞价（CAS）、盘后。
+
+    Why: CAS 期间盘口为集合挂单汇总（实盘 2026-05-15 案例：16:01 后卖盘深度
+    暴增到 4-5 万股、价格"卡死"在 IEP 800），脚本会把集合挂单误判为"大卖单
+    涌入"持续发出 ENTRY=55 假信号 7+ 分钟。仅在连续交易时段打分能避免此问题。
+    """
+    if now.weekday() >= 5:    # 周末
+        return False
+    t = now.time()
+    return any(start <= t < end for start, end in HK_TRADING_SESSIONS)
+
+
+def _trading_phase_label(now: datetime.datetime) -> str:
+    """返回当前所处交易时段的可读标签，用于日志输出。"""
+    if now.weekday() >= 5:
+        return "周末休市"
+    t = now.time()
+    if t < datetime.time(9, 0):
+        return "盘前"
+    if t < datetime.time(9, 30):
+        return "开盘集合竞价"
+    if datetime.time(12, 0) <= t < datetime.time(13, 0):
+        return "午休"
+    if datetime.time(16, 0) <= t < datetime.time(16, 10):
+        return "收盘集合竞价(CAS)"
+    if t >= datetime.time(16, 10):
+        return "盘后"
+    return "非交易时段"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -620,18 +683,20 @@ def analyze_order_book(conn: sqlite3.Connection,
     score = 0
     signals: list[str] = []
 
-    if len(history) >= 5 and current_ask > 0:
-        # 排除刚存入的当前值，与 analyze_short_entry 保持一致；中位数对极端低值鲁棒
-        baseline = statistics.median(history[1:])
-        if baseline > 0:
-            shrink_pct = (baseline - current_ask) / baseline * 100
+    # 用近 K 轮中位数代替单点采样，避免稀薄盘口的挂/撤单噪音被放大成 +25 分信号
+    if len(history) >= ASK_DEPTH_SMOOTH_K + 4 and current_ask > 0:
+        smoothed_current = statistics.median(history[:ASK_DEPTH_SMOOTH_K])
+        baseline = statistics.median(history[ASK_DEPTH_SMOOTH_K:])
+        if baseline > 0 and smoothed_current > 0:
+            shrink_pct = (baseline - smoothed_current) / baseline * 100
             now_ts = time.time()
             last_log_ts = getattr(analyze_order_book, "_last_log_ts", 0.0)
             should_log = (now_ts - last_log_ts) >= ASK_DEPTH_LOG_COOLDOWN_SECS
             if shrink_pct >= ASK_DEPTH_SHRINK_PCT:
                 pts = 25
                 msg = (f"卖盘深度骤减 {shrink_pct:.1f}% "
-                       f"(当前 {current_ask:,.0f} vs 基准 {baseline:,.0f} 股) [+{pts}分]")
+                       f"(近{ASK_DEPTH_SMOOTH_K}轮中位 {smoothed_current:,.0f} "
+                       f"vs 基准 {baseline:,.0f} 股) [+{pts}分]")
                 score += pts
                 signals.append(msg)
                 if should_log:
@@ -1019,31 +1084,41 @@ def analyze_short_entry(
             signals.append(msg)
 
     # ── 维度 2：卖盘深度骤增（大卖单出现）──────────────────
+    # 用近 K 轮中位数代替单点采样；trap_suspect 同样用近 K 轮失衡度中位数，
+    # 避免一秒的盘口快照决定 +25 分的归属。
     ask_history = db_get_recent_ask_depth(conn, ASK_DEPTH_WINDOW)
-    if len(ask_history) >= 5 and current_ask > 0:
-        avg_ask = statistics.median(ask_history[1:])   # 排除当前轮，与 analyze_order_book 一致
-        if avg_ask > 0:
-            surge_pct = (current_ask - avg_ask) / avg_ask * 100
+    imb_rows_trap = conn.execute(
+        "SELECT imbalance FROM orderbook_snapshots ORDER BY id DESC LIMIT ?",
+        (SHORT_IMB_SMOOTH_K,),
+    ).fetchall()
+    smoothed_imb = (statistics.median(r[0] for r in imb_rows_trap)
+                    if imb_rows_trap else current_imbalance)
+    if len(ask_history) >= ASK_DEPTH_SMOOTH_K + 4 and current_ask > 0:
+        smoothed_ask = statistics.median(ask_history[:ASK_DEPTH_SMOOTH_K])
+        avg_ask = statistics.median(ask_history[ASK_DEPTH_SMOOTH_K:])
+        if avg_ask > 0 and smoothed_ask > 0:
+            surge_pct = (smoothed_ask - avg_ask) / avg_ask * 100
             # 诱空检测：卖盘骤增但摆盘仍明显偏多 → 大卖单与买盘强势同时存在，
             # 通常是挂单制造空头跟风后立即撤单的套路，不予加分。
-            trap_suspect = current_imbalance > SHORT_TRAP_IMB_SUPPRESS
+            trap_suspect = smoothed_imb > SHORT_TRAP_IMB_SUPPRESS
             if surge_pct >= SHORT_ASK_SURGE_PCT:
                 if trap_suspect:
-                    msg = (f"⚠ 卖盘骤增 {surge_pct:.1f}% 但摆盘失衡度 "
-                           f"{current_imbalance:+.3f} 偏多，疑似诱空挂单，不计分")
+                    msg = (f"⚠ 卖盘骤增 {surge_pct:.1f}% 但近{SHORT_IMB_SMOOTH_K}"
+                           f"轮失衡度中位 {smoothed_imb:+.3f} 偏多，疑似诱空挂单，不计分")
                     signals.append(msg)
                     db_save_signal(conn, "SHORT_ASK_SURGE_TRAP", msg, 0)
                 else:
                     pts = 25
-                    msg = (f"卖盘深度骤增 {surge_pct:.1f}%（当前 {current_ask:,.0f} "
-                           f"vs 均值 {avg_ask:,.0f} 股），大卖单涌入 [+{pts}分]")
+                    msg = (f"卖盘深度骤增 {surge_pct:.1f}%（近{ASK_DEPTH_SMOOTH_K}"
+                           f"轮中位 {smoothed_ask:,.0f} vs 均值 {avg_ask:,.0f} 股），"
+                           f"大卖单涌入 [+{pts}分]")
                     score += pts
                     signals.append(msg)
                     db_save_signal(conn, "SHORT_ASK_SURGE", msg, pts)
             elif surge_pct >= SHORT_ASK_SURGE_PCT * 0.5:
                 if trap_suspect:
-                    msg = (f"⚠ 卖盘上升 {surge_pct:.1f}% 但摆盘偏多 "
-                           f"{current_imbalance:+.3f}，疑似诱空，不计分")
+                    msg = (f"⚠ 卖盘上升 {surge_pct:.1f}% 但近{SHORT_IMB_SMOOTH_K}"
+                           f"轮失衡度中位 {smoothed_imb:+.3f} 偏多，疑似诱空，不计分")
                     signals.append(msg)
                 else:
                     pts = 12
@@ -1163,13 +1238,13 @@ def analyze_short_exit(
         urgency = max(urgency, 50)
         reasons.append(f"逼空风险上升至 {squeeze_score}，建议减仓")
 
-    # 2. 卖盘深度骤减（护盾消失）
+    # 2. 卖盘深度骤减（护盾消失）—— 用近 K 轮中位数过滤稀薄盘口噪音
     ask_history = db_get_recent_ask_depth(conn, ASK_DEPTH_WINDOW)
-    if len(ask_history) >= 5:
-        current_ask = ask_history[0]
-        avg_ask = statistics.mean(ask_history[1:6])
-        if avg_ask > 0:
-            shrink_pct = (avg_ask - current_ask) / avg_ask * 100
+    if len(ask_history) >= ASK_DEPTH_SMOOTH_K + 4:
+        smoothed_ask = statistics.median(ask_history[:ASK_DEPTH_SMOOTH_K])
+        avg_ask = statistics.median(ask_history[ASK_DEPTH_SMOOTH_K:ASK_DEPTH_SMOOTH_K + 5])
+        if avg_ask > 0 and smoothed_ask > 0:
+            shrink_pct = (avg_ask - smoothed_ask) / avg_ask * 100
             if shrink_pct >= 40:
                 urgency = max(urgency, 65)
                 msg = f"卖盘深度骤减 {shrink_pct:.1f}%，空头回补迹象，建议减仓"
@@ -1382,6 +1457,10 @@ class MonitorState:
     volume_surge:      Optional[float] = None   # 卖空量爆量比
     in_position:       bool            = False     # 手动标记是否持有空仓
     recent_squeeze_scores: list[int]   = field(default_factory=list)  # 近 N 轮逼空评分（最旧在前）
+    # 数据停滞检测：价格 + 大单累计连续未变 → Futu 无新成交，跳过打分
+    _prev_price:       Optional[float] = None
+    _prev_big_net:     Optional[float] = None
+    _stale_count:      int             = 0
 
 
 def print_dashboard(
@@ -1524,12 +1603,21 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             today_str = now.date().isoformat()
 
             # ── 每日 HKEX 爬取（收盘后） ──────────────────────────
+            # 独立于交易时段判断，因为爬取窗口（17:00 后）本身就在盘后
             if (state.last_hkex_date != today_str
                     and now.hour >= HKEX_FETCH_HOUR):
                 ratio = fetch_hkex_and_store(conn, ctx, now.date())
                 if ratio is not None:
                     state.last_hkex_date    = today_str
                     state.latest_hkex_ratio = round(ratio, 4)
+
+            # ── 交易时段守门：非连续交易时段直接跳过打分 ──────────
+            # 避免在 CAS（16:00-16:10）/ 集合竞价 / 午休时把集合挂单当真实信号
+            if not _is_trading_hours(now):
+                phase = _trading_phase_label(now)
+                log.info(f"[{phase}] {now.strftime('%H:%M:%S')} 跳过打分（数据非连续交易语义）")
+                time.sleep(REALTIME_INTERVAL)
+                continue
 
             # ── 获取最新价格并存入历史 ─────────────────────────────
             ret_q, qdata = ctx.get_stock_quote(code_list=[SYMBOL])
@@ -1548,6 +1636,26 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             if ob:
                 state.latest_ask_depth = ob["ask_depth"]
                 state.latest_imbalance = ob["imbalance"]
+
+            # ── 数据停滞检测：价格 + 大单累计连续 N 轮未变 → 跳过 ─
+            # Futu 在市场暂停 / 网络断流 / 极低流动性时会返回相同快照，
+            # 此时打分基于陈旧数据，输出的"持续偏空/偏多"等信号无意义。
+            if (state.last_price is not None
+                    and state.last_price == state._prev_price
+                    and state.latest_big_net == state._prev_big_net):
+                state._stale_count += 1
+            else:
+                state._stale_count = 0
+                state._prev_price   = state.last_price
+                state._prev_big_net = state.latest_big_net
+
+            if state._stale_count >= STALE_DATA_ROUNDS:
+                log.warning(
+                    f"[数据停滞] 价格 {state.last_price} + 大单累计连续 "
+                    f"{state._stale_count} 轮未更新，跳过打分（市场暂停/网络异常？）"
+                )
+                time.sleep(REALTIME_INTERVAL)
+                continue
 
             # ── HKEX 历史卖空动能分析（日级，每轮都算）────────────
             hkex_support, hkex_squeeze_risk, hkex_sigs, hkex_stats = \
@@ -1573,7 +1681,12 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             if len(state.recent_squeeze_scores) > SHORT_SQUEEZE_LOOKBACK:
                 state.recent_squeeze_scores = \
                     state.recent_squeeze_scores[-SHORT_SQUEEZE_LOOKBACK:]
-            recent_max_squeeze = max(state.recent_squeeze_scores)
+            # 用第二高（trimmed max）代替最高，对单次 spike 鲁棒：
+            # 一次诱多刷盘把分数冲到 33 后立即回落，不应锁死后续 60 秒入场窗口。
+            # 仅当 ≥2 轮真实持续高位时才会触发 BLOCKED（实盘 2026-05-15 14:17:05
+            # 案例：[33,33,33,25] 仍 BLOCKED 正确；[33,8,0,0] 不再误 BLOCKED）。
+            _sorted = sorted(state.recent_squeeze_scores)
+            recent_max_squeeze = _sorted[-2] if len(_sorted) >= 2 else _sorted[-1]
 
             # ── 做空入场评分（HKEX 动能分叠加）──────────────────
             short_score, short_signal, short_sigs = analyze_short_entry(
