@@ -62,6 +62,10 @@ HK_TRADING_SESSIONS = [
     (datetime.time(13, 0),  datetime.time(16, 0)),
 ]
 STALE_DATA_ROUNDS = 5             # 价格+大单累计连续 N 轮未变 → 视为数据停滞，跳过打分
+API_FAIL_TOLERANCE_ROUNDS = 2     # 资金流/摆盘 API 连续失败 N 轮 → 跳过打分
+                                  # (Futu 失败时旧值会被保留，若不守门则评分基于陈旧快照。
+                                  #  实盘 2026-05-18 09:36:56-09:37:45 案例：3 轮 API 失败，
+                                  #  评分用 09:36:30 的冻结数据，错过 +3.5% 拉升预警)
 
 # 逼空信号阈值
 SHORT_RATIO_WINDOW   = 5          # 卖空占比趋势回看天数
@@ -94,6 +98,18 @@ SHORT_IMB_FLIP_WINDOW = 6         # 失衡度极性翻转检测回看轮数
 SHORT_IMB_FLIP_MIN    = 2         # 近 N 轮翻转 ≥ 此值 → 视为挂单博弈，禁止 ENTRY
 SHORT_IMB_FLIP_BAND   = 0.10      # |imb| ≤ 此值视为中性轮，不参与翻转计数
 SHORT_IMB_SMOOTH_K    = 3         # trap_suspect 判定用近 K 轮失衡度中位数
+
+# 价格反弹逼空维度（捕捉"被踏空"场景）
+# Why: 原逼空评分仅看卖盘骤减/摆盘偏多/大单加速，对"价格已实际反转向上"完全无感。
+# 实盘 2026-05-18 09:32:58 ENTRY 触发价 765.5 → 09:38:30 反弹至 792.5 (+3.5%)，
+# 期间逼空评分始终 ≤ 20，毫无离场预警。本维度专门捕捉这种逆向走势。
+PRICE_REVERSAL_WINDOW       = 30      # 反弹基准窗口（轮次，15s × 30 ≈ 7.5 分钟）
+PRICE_REVERSAL_PCT_LIGHT    = 0.8     # 反弹 ≥ 此 % → 计 LIGHT 分
+PRICE_REVERSAL_PCT_MED      = 1.5     # 反弹 ≥ 此 % → 计 MED 分
+PRICE_REVERSAL_PCT_HEAVY    = 2.5     # 反弹 ≥ 此 % → 计 HEAVY 分
+PRICE_REVERSAL_SCORE_LIGHT  = 8
+PRICE_REVERSAL_SCORE_MED    = 15
+PRICE_REVERSAL_SCORE_HEAVY  = 25
 
 
 # ═══════════════════════════════════════════════════════════
@@ -722,6 +738,44 @@ def analyze_order_book(conn: sqlite3.Connection,
             signals.append(msg)
 
     return score, signals
+
+
+# ═══════════════════════════════════════════════════════════
+# 六-B、信号  价格反弹逼空维度
+# ═══════════════════════════════════════════════════════════
+def analyze_price_reversal(
+    conn: sqlite3.Connection,
+    current_price: Optional[float],
+) -> tuple[int, list[str]]:
+    """
+    价格反弹逼空维度：当前价相对近 PRICE_REVERSAL_WINDOW 轮低点反弹幅度越大，
+    说明短期已转入逆向走势，做空成本上升 → 计入逼空分。
+
+    采用滚动窗口低点而非 session_low，让信号在反弹企稳后自然衰减，
+    避免日内一次低点把后续整天都标为"高风险"。
+    """
+    if current_price is None:
+        return (0, [])
+    prices = db_get_recent_prices(conn, PRICE_REVERSAL_WINDOW)
+    if len(prices) < 3:
+        return (0, [])
+    low = min(prices)
+    if low <= 0:
+        return (0, [])
+    rebound_pct = (current_price - low) / low * 100
+    if rebound_pct < PRICE_REVERSAL_PCT_LIGHT:
+        return (0, [])
+
+    if rebound_pct >= PRICE_REVERSAL_PCT_HEAVY:
+        pts = PRICE_REVERSAL_SCORE_HEAVY
+    elif rebound_pct >= PRICE_REVERSAL_PCT_MED:
+        pts = PRICE_REVERSAL_SCORE_MED
+    else:
+        pts = PRICE_REVERSAL_SCORE_LIGHT
+
+    msg = (f"价格自近 {PRICE_REVERSAL_WINDOW} 轮低点 {low:.2f} 反弹 "
+           f"{rebound_pct:+.2f}%（当前 {current_price:.2f}）[+{pts}分]")
+    return (pts, [msg])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1461,6 +1515,9 @@ class MonitorState:
     _prev_price:       Optional[float] = None
     _prev_big_net:     Optional[float] = None
     _stale_count:      int             = 0
+    # API 失败计数：连续失败 ≥ API_FAIL_TOLERANCE_ROUNDS 时跳过打分
+    _capital_fail_count:   int         = 0
+    _orderbook_fail_count: int         = 0
 
 
 def print_dashboard(
@@ -1630,12 +1687,32 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             cf = fetch_capital_flow(ctx, conn)
             if cf:
                 state.latest_big_net = cf["big_net"]
+                state._capital_fail_count = 0
+            else:
+                state._capital_fail_count += 1
 
             # ── 信号③：摆盘深度 ───────────────────────────────────
             ob = fetch_order_book(ctx, conn)
             if ob:
                 state.latest_ask_depth = ob["ask_depth"]
                 state.latest_imbalance = ob["imbalance"]
+                state._orderbook_fail_count = 0
+            else:
+                state._orderbook_fail_count += 1
+
+            # ── 数据新鲜度守门：核心 API 连续失败 → 跳过打分 ──────
+            # Futu API 失败时 state 旧值会被保留，若不守门则评分基于陈旧快照
+            # （实盘 2026-05-18 09:36:56-09:37:45 案例：3 轮 API 失败，
+            # 评分用 09:36:30 的冻结数据，错过 +3.5% 拉升预警）
+            if (state._capital_fail_count >= API_FAIL_TOLERANCE_ROUNDS
+                    or state._orderbook_fail_count >= API_FAIL_TOLERANCE_ROUNDS):
+                log.warning(
+                    f"[API 失效] 资金流失败 {state._capital_fail_count} 轮 / "
+                    f"摆盘失败 {state._orderbook_fail_count} 轮 ≥ "
+                    f"{API_FAIL_TOLERANCE_ROUNDS}，跳过打分（避免基于陈旧快照）"
+                )
+                time.sleep(REALTIME_INTERVAL)
+                continue
 
             # ── 数据停滞检测：价格 + 大单累计连续 N 轮未变 → 跳过 ─
             # Futu 在市场暂停 / 网络断流 / 极低流动性时会返回相同快照，
@@ -1666,15 +1743,16 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 state.momentum_ratio    = hkex_stats.get("momentum_ratio")
                 state.volume_surge      = hkex_stats.get("volume_surge")
 
-            # ── 逼空评分（含 HKEX 成本线风险项）─────────────────
+            # ── 逼空评分（含 HKEX 成本线风险项 + 价格反弹维度）──
             s1, s1_support, sg1 = analyze_short_ratio_trend(conn)
             s2, sg2 = analyze_capital_flow(conn)
             s3, sg3 = analyze_order_book(conn, state.latest_ask_depth or 0)
-            squeeze_score   = min(s1 + s2 + s3 + hkex_squeeze_risk, 100)
+            s_rev, sg_rev = analyze_price_reversal(conn, state.last_price)
+            squeeze_score   = min(s1 + s2 + s3 + hkex_squeeze_risk + s_rev, 100)
             # sg1 中可能包含「支撑做空」语义（价格下行时的反转计分），分流展示
             sg1_squeeze = [s for s in sg1 if "支撑做空" not in s]
             sg1_support = [s for s in sg1 if "支撑做空" in s]
-            squeeze_signals = sg1_squeeze + sg2 + sg3 + [s for s in hkex_sigs if "逼空" in s or "亏损" in s]
+            squeeze_signals = sg1_squeeze + sg2 + sg3 + sg_rev + [s for s in hkex_sigs if "逼空" in s or "亏损" in s]
 
             # ── 维护近 N 轮逼空评分历史（供做空安全门取峰值）─────
             state.recent_squeeze_scores.append(squeeze_score)
