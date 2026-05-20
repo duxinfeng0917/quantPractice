@@ -62,6 +62,10 @@ HK_TRADING_SESSIONS = [
     (datetime.time(13, 0),  datetime.time(16, 0)),
 ]
 STALE_DATA_ROUNDS = 5             # 价格+大单累计连续 N 轮未变 → 视为数据停滞，跳过打分
+BIG_NET_STALE_ROUNDS = 5          # 大单累计单独连续 N 轮未变 → "大单净流入"维度跳过计分
+                                  # (Bug 14：实盘 2026-05-20 10:00-10:03 大单冻在 -766.4 万 5 分钟，
+                                  #  价格 698→701 上行，旧 stale 守门是 AND（价格+大单都不变）
+                                  #  导致价格一变就解除停滞，但大单仍陈旧，继续打 +15 分)
 API_FAIL_TOLERANCE_ROUNDS = 2     # 资金流/摆盘 API 连续失败 N 轮 → 跳过打分
                                   # (Futu 失败时旧值会被保留，若不守门则评分基于陈旧快照。
                                   #  实盘 2026-05-18 09:36:56-09:37:45 案例：3 轮 API 失败，
@@ -77,6 +81,10 @@ ASK_DEPTH_LOG_COOLDOWN_SECS = 60  # 同一深度骤减事件的 WARNING 日志/d
 BIGFLOW_REVERSAL_MIN = 2          # 大单净流入连续正值 N 轮 → 触发反转信号
 BIGFLOW_WINDOW       = 10         # 大单净流入反转/加速判断窗口（轮次）
 BIGFLOW_STREAK_WINDOW = 120       # streak 计数窗口；与 BIGFLOW_WINDOW 解耦，避免 streak 被截断为 10
+# 大单累计虽负但近期 Δ 转买入（Bug 16）：单一累计静态值掩盖近期资金转向
+# capital_flow 表已按 update_time 去重，相邻两行约 1 分钟跨度，故 recent[0]-recent[1] 就是近 1 分钟 Δ
+BIG_NET_DELTA_THRESHOLD = 500_000  # 单轮 Δ ≥ 50 万港元才算显著买入（小于此值视为噪音）
+BIG_NET_REBUY_PRICE_PCT = 0.3      # 同期价格涨幅 ≥ 此 % 才视为方向咬合（防纯撤单噪音）
 
 # 做空信号阈值
 SHORT_SAFE_SQUEEZE   = 25         # 逼空评分超过此值时禁止新开空单
@@ -628,17 +636,35 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
         # 持续净流入但未经历负值阶段：按 streak 长度分档（保守降权）。
         # 旧值 5/10/15 让逼空评分常态有 +15 底分，与"持续上行"市场常态混淆。
         # 反转 + 持续仍给 +25，纯持续顶格 +12。
-        if streak >= 16:
-            pts = 12
-        elif streak >= 8:
-            pts = 8
-        elif streak >= 4:
-            pts = 5
+        #
+        # Bug 13 防护：价格同步性核查
+        # 2026-05-18 实盘：大单净流入 +2,121 → +5,052 万持续加速正值，但价格
+        # 仅 777 → 796.5（+2.5% 后无法突破日高 827.5），次日跳空 -8%。机构
+        # 在用大买单接散户卖单出货 —— 统计上"主动买入"但实际是出货。
+        # 故当流入持续正值而同期价格停滞（< 0.3%）时，不计逼空风险分。
+        sync_window = min(streak, 30)
+        sync_prices = db_get_recent_prices(conn, sync_window)
+        price_pct = 0.0
+        if len(sync_prices) >= 5:
+            price_pct = (sync_prices[-1] - sync_prices[0]) / sync_prices[0] * 100
+
+        if len(sync_prices) >= 5 and price_pct < 0.3:
+            msg = (f"⚠ 大单净流入持续 {streak} 轮但价格 {price_pct:+.2f}%"
+                   f"（近 {sync_window} 轮停滞），疑似出货式拉升，不计逼空分")
+            signals.append(msg)
+            db_save_signal(conn, "BIGFLOW_PUMP_SUSPECT", msg, 0)
         else:
-            pts = 3
-        msg = f"大单净流入持续正值 {streak} 轮 [+{pts}分]"
-        score += pts
-        signals.append(msg)
+            if streak >= 16:
+                pts = 12
+            elif streak >= 8:
+                pts = 8
+            elif streak >= 4:
+                pts = 5
+            else:
+                pts = 3
+            msg = f"大单净流入持续正值 {streak} 轮 [+{pts}分]"
+            score += pts
+            signals.append(msg)
 
     # 加速判断：最新值是否远大于前几轮均值
     if len(recent) >= 2 and recent[0] > 0:
@@ -648,6 +674,26 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
             msg = f"大单净流入加速：本轮 {recent[0]/10000:+,.1f} 万 vs 均值 {avg_prev/10000:+,.1f} 万 [+{pts}分]"
             score += pts
             signals.append(msg)
+
+    # Bug 16: 累计仍负但近期 Δ 显著转买入 + 价格咬合 → 资金方向转向，空头回补/多头进场
+    # 实盘 2026-05-20 10:19-10:25：大单累计 -1083→-988→-894 万（5 分钟 +189 万买入），
+    # 价格 698→708 (+1.4%)，但因累计仍负，旧逻辑只在 analyze_short_entry 维度 1 加
+    # +15"持续为负"，对真实的资金转向毫无感知。
+    if (len(recent) >= 2
+            and recent[0] < 0
+            and (recent[0] - recent[1]) >= BIG_NET_DELTA_THRESHOLD):
+        flow_delta = recent[0] - recent[1]
+        sync_prices = db_get_recent_prices(conn, 8)
+        if len(sync_prices) >= 5:
+            price_pct = (sync_prices[-1] - sync_prices[0]) / sync_prices[0] * 100
+            if price_pct >= BIG_NET_REBUY_PRICE_PCT:
+                pts = 10
+                msg = (f"大单累计 {recent[0]/10000:+,.1f} 万仍为负但近期 Δ "
+                       f"{flow_delta/10000:+,.1f} 万买入，价格 {price_pct:+.2f}% "
+                       f"咬合 → 空头回补/多头进场 [+{pts}分]")
+                score += pts
+                signals.append(msg)
+                db_save_signal(conn, "BIG_FLOW_REBUY", msg, pts)
 
     result = (score, signals)
     analyze_capital_flow._last_id = latest_id
@@ -783,6 +829,7 @@ def analyze_price_reversal(
 # ═══════════════════════════════════════════════════════════
 def analyze_short_ratio_trend(
     conn: sqlite3.Connection,
+    state: Optional["MonitorState"] = None,
 ) -> tuple[int, int, list[str]]:
     """
     卖空占比趋势分析。
@@ -798,6 +845,11 @@ def analyze_short_ratio_trend(
       支撑而非逼空风险。
     - 占比处于历史高位（>25%）→ 做空拥挤，逼空风险累积
     - 占比极端高位（>35%）→ 强加分
+
+    Bug 13 路径锁：高位拐头分流（squeeze vs support）依赖 SHORT_RATIO_PRICE_
+    CONFIRM_WIN 滚动窗口的价格首尾对比，窗口约 7.5 分钟，会随时间滚动导致
+    "下行→上行"翻转，让同一事实在评分两侧反复跳变。state 提供后，本函数
+    在同一日同一 (prev, latest) 元组下锁定首次判定的路径直到次日。
     """
     ratios = db_get_recent_hkex(conn, SHORT_RATIO_WINDOW + 2)
     score = 0
@@ -824,26 +876,56 @@ def analyze_short_ratio_trend(
         drop = prev - latest
         pts = 25
 
-        prices = db_get_recent_prices(conn, SHORT_RATIO_PRICE_CONFIRM_WIN)
-        price_uptrend = len(prices) < 5 or prices[-1] >= prices[0]
+        today_str = datetime.date.today().isoformat()
+        lock_key  = (round(prev, 4), round(latest, 4))
 
-        if price_uptrend:
-            # 价格上行（或样本不足）→ 维持原有逼空启动语义
-            msg = (f"卖空占比高位拐头：连涨 {consecutive_rises} 日后回落 "
-                   f"{prev:.2f}% → {latest:.2f}% (↓{drop:.2f}pp) [+{pts}分]")
-            score += pts
-            signals.append(msg)
-            log.warning(f"[趋势反转] {msg}")
-            db_save_signal(conn, "SHORT_RATIO_PEAK", msg, pts)
+        # 命中路径锁：直接复用当日已锁定的判定
+        if (state is not None
+                and state._ratio_lock_date == today_str
+                and state._ratio_lock_key == lock_key
+                and state._ratio_lock_path in ("squeeze", "support")):
+            if state._ratio_lock_path == "squeeze":
+                msg = (f"卖空占比高位拐头：连涨 {consecutive_rises} 日后回落 "
+                       f"{prev:.2f}% → {latest:.2f}% (↓{drop:.2f}pp) [+{pts}分]"
+                       f" (路径锁定·当日)")
+                score += pts
+                signals.append(msg)
+            else:
+                msg = (f"卖空占比高位拐头（{prev:.2f}%→{latest:.2f}%）"
+                       f"空头已清算且行情走弱 [支撑做空+{pts}分] (路径锁定·当日)")
+                support += pts
+                signals.append(msg)
         else:
-            # 价格下行 → 空头已清算 + 行情走弱，逼空假设被否，转入做空支撑
-            move_pct = (prices[-1] - prices[0]) / prices[0] * 100
-            msg = (f"卖空占比高位拐头（{prev:.2f}%→{latest:.2f}%）但日内"
-                   f"价格 {move_pct:+.2f}%，空头已清算且行情走弱 "
-                   f"[支撑做空+{pts}分]")
-            support += pts
-            signals.append(msg)
-            db_save_signal(conn, "SHORT_RATIO_PEAK_BEARISH", msg, pts)
+            prices = db_get_recent_prices(conn, SHORT_RATIO_PRICE_CONFIRM_WIN)
+            price_uptrend = len(prices) < 5 or prices[-1] >= prices[0]
+            chosen_path = "squeeze" if price_uptrend else "support"
+
+            if price_uptrend:
+                # 价格上行（或样本不足）→ 维持原有逼空启动语义
+                msg = (f"卖空占比高位拐头：连涨 {consecutive_rises} 日后回落 "
+                       f"{prev:.2f}% → {latest:.2f}% (↓{drop:.2f}pp) [+{pts}分]")
+                score += pts
+                signals.append(msg)
+                log.warning(f"[趋势反转] {msg}")
+                db_save_signal(conn, "SHORT_RATIO_PEAK", msg, pts)
+            else:
+                # 价格下行 → 空头已清算 + 行情走弱，逼空假设被否，转入做空支撑
+                move_pct = (prices[-1] - prices[0]) / prices[0] * 100
+                msg = (f"卖空占比高位拐头（{prev:.2f}%→{latest:.2f}%）但日内"
+                       f"价格 {move_pct:+.2f}%，空头已清算且行情走弱 "
+                       f"[支撑做空+{pts}分]")
+                support += pts
+                signals.append(msg)
+                db_save_signal(conn, "SHORT_RATIO_PEAK_BEARISH", msg, pts)
+
+            # 锁定本日判定，避免窗口滚动反复翻转
+            if state is not None:
+                state._ratio_lock_date = today_str
+                state._ratio_lock_key  = lock_key
+                state._ratio_lock_path = chosen_path
+                log.info(
+                    f"[拐头路径锁] {today_str} {lock_key} → {chosen_path}"
+                )
 
     # 做空拥挤（高位累积风险）
     if latest >= 35:
@@ -1024,8 +1106,136 @@ def analyze_hkex_short_momentum(
 
 
 # ═══════════════════════════════════════════════════════════
+# 八-B、出货式拉升检测（Bug 13 防护）
+# ═══════════════════════════════════════════════════════════
+def analyze_distribution_pump(
+    conn: sqlite3.Connection,
+    current_price: Optional[float],
+    hkex_stats: dict,
+) -> tuple[int, list[str]]:
+    """
+    出货式拉升识别（Bug 13）：横向交叉验证防止"大单净流入持续正值"被误读为多头。
+
+    机构在高位用大单接散户卖盘出货时呈现的复合特征：
+        - 大单净流入持续正值（streak ≥ 8 轮）
+        - 反弹幅度逐次递减（peaks[0] > peaks[1] > peaks[2]）
+        - 价格无法突破日内高点
+        - HKEX 卖空占比仍处高位 / 动能比偏多（真实空头未撤）
+        - 可选：失衡度高频翻转（盘口博弈）
+
+    满足主条件 → 返回做空入场支撑分 +20。
+    弱信号（反弹乏力 + 失衡度翻转）→ +10。
+
+    2026-05-18 实盘：5 个指标全部命中，但当时无此检测维度，做空 ENTRY
+    信号被假"流入加速"信号反复证伪，错过日高出货后次日跳空 -8% 的机会。
+    """
+    if current_price is None:
+        return 0, []
+
+    # streak 独立计算（避免依赖外部传参）
+    streak_history = db_get_recent_big_net(conn, BIGFLOW_STREAK_WINDOW)
+    streak = 0
+    for v in streak_history:
+        if v > 0:
+            streak += 1
+        else:
+            break
+    if streak < 8:
+        return 0, []
+
+    prices = db_get_recent_prices(conn, 60)
+    if len(prices) < 30:
+        return 0, []
+
+    # 条件1：反弹幅度递减（把 ~15 分钟价格切成 3 段，每段 max 单调递减）
+    seg = len(prices) // 3
+    peaks = [max(prices[i * seg:(i + 1) * seg]) for i in range(3)]
+    rebound_fading = peaks[2] < peaks[1] and peaks[1] <= peaks[0]
+
+    # 条件2：未突破日内高点（留 0.5% 缓冲）
+    session_high = db_get_session_high(
+        conn, datetime.date.today().isoformat()
+    )
+    near_session_high = bool(
+        session_high and current_price < session_high * 0.995
+    )
+
+    # 条件3：HKEX 真实空头仍在（占比高位 或 动能比 ≥ 1.5×）
+    latest_ratio = hkex_stats.get("latest_ratio") or 0
+    momentum = hkex_stats.get("momentum_ratio") or 0
+    hkex_bearish = latest_ratio >= 8.0 or momentum >= 1.5
+
+    if rebound_fading and near_session_high and hkex_bearish:
+        pts = 20
+        msg = (
+            f"⚠ 出货式拉升嫌疑：大单流入持续 {streak} 轮但反弹递减"
+            f"（{peaks[0]:.1f}→{peaks[1]:.1f}→{peaks[2]:.1f}），"
+            f"HKEX 占比 {latest_ratio:.1f}%（动能 {momentum:.2f}×）"
+            f"维持高位 [支撑做空+{pts}分]"
+        )
+        db_save_signal(conn, "DISTRIBUTION_PUMP_SUSPECT", msg, pts)
+        return pts, [msg]
+
+    # 弱信号：反弹乏力 + 盘口高频翻转
+    if rebound_fading:
+        flips = db_count_imb_flips(conn, 12, SHORT_IMB_FLIP_BAND)
+        if flips >= 3:
+            pts = 10
+            msg = (
+                f"⚠ 拉升乏力（{peaks[0]:.1f}→{peaks[2]:.1f}）+ "
+                f"盘口翻转 {flips} 次，机构博弈嫌疑 [支撑做空+{pts}分]"
+            )
+            return pts, [msg]
+
+    return 0, []
+
+
+# ═══════════════════════════════════════════════════════════
 # 九、做空信号引擎
 # ═══════════════════════════════════════════════════════════
+
+def apply_short_entry_failsafes(
+    conn: sqlite3.Connection,
+    score: int,
+    sig_type: str,
+    current_imbalance: float,
+    signals: list[str],
+) -> tuple[int, str, list[str]]:
+    """
+    ENTRY 信号的 failsafe 集合（Bug 6 + Bug 9），需要在两处调用：
+
+    1. `analyze_short_entry` 末尾：拦截主信号 score ≥ SHORT_ENTRY_MIN 的 ENTRY；
+    2. 主循环 ENTRY 升级后：当合并 hkex/s1/pump 支撑分把 HOLD 推到 ENTRY 时，
+       analyze_short_entry 内部 sig_type 始终是 HOLD，failsafe 永不触发——
+       Bug 18 真实案例：2026-05-20 13:36-13:42 实盘做空 63-78(ENTRY)，
+       但 imbalance 整段 +0.92~+0.97（极端买盘强势），Failsafe 1 因被
+       绕过未降级，应该 CAUTION。修法：主循环升级后再调用一次本函数。
+
+    返回 BLOCKED 时丢弃 signals 只保留 reason（与原 in-place 行为一致）。
+    """
+    # Failsafe 1：摆盘明显偏多时强制降级（Bug 6 防底部追空）
+    if sig_type == "ENTRY" and current_imbalance > SHORT_TRAP_IMB_BLOCK:
+        signals.append(
+            f"⚠ 摆盘失衡度 {current_imbalance:+.3f} 明显偏多（>{SHORT_TRAP_IMB_BLOCK}），"
+            f"买盘强势，ENTRY 降级为 CAUTION 防诱空"
+        )
+        sig_type = "CAUTION"
+
+    # Failsafe 2：失衡度高频翻转 → 挂单博弈（Bug 9）
+    # 2026-05-12 实盘 ENTRY=98 触发瞬间 imbalance 6 轮内翻转 3 次，
+    # 价格 1.5 分钟反弹 +1.1%。高频翻转是主力挂单/撤单博弈的特征。
+    if sig_type == "ENTRY":
+        flip_count = db_count_imb_flips(
+            conn, SHORT_IMB_FLIP_WINDOW, SHORT_IMB_FLIP_BAND
+        )
+        if flip_count >= SHORT_IMB_FLIP_MIN:
+            reason = (f"近 {SHORT_IMB_FLIP_WINDOW} 轮失衡度极性翻转 "
+                      f"{flip_count} 次，识别为挂单博弈/操纵性信号，禁止开空")
+            db_save_signal(conn, "SHORT_IMB_FLIP_TRAP", reason, 0)
+            return 0, "BLOCKED", [reason]
+
+    return score, sig_type, signals
+
 
 def analyze_short_entry(
     conn: sqlite3.Connection,
@@ -1034,6 +1244,7 @@ def analyze_short_entry(
     current_ask: float,
     current_imbalance: float,
     recent_max_squeeze: Optional[int] = None,
+    big_net_stale: bool = False,
 ) -> tuple[int, str, list[str]]:
     """
     做空入场评分（0-100）及信号类型。
@@ -1105,8 +1316,11 @@ def analyze_short_entry(
     signals: list[str] = []
 
     # ── 维度 1：大单净流入方向 ─────────────────────────────
+    # Bug 14: 大单 cumulative 多轮冻结时本维度跳过，避免基于陈旧值持续加分
     big_nets = db_get_recent_big_net(conn, BIGFLOW_WINDOW)
-    if len(big_nets) >= 4:
+    if big_net_stale:
+        signals.append("ℹ 大单累计冻结多轮，'大单净流入'维度本轮跳过")
+    elif len(big_nets) >= 4:
         latest_net  = big_nets[0]
         earlier_net = big_nets[1:5]
         had_positive = any(v > 0 for v in earlier_net)
@@ -1132,10 +1346,19 @@ def analyze_short_entry(
                 signals.append(msg)
                 db_save_signal(conn, "SHORT_BIGFLOW_REVERSAL", msg, pts)
         elif latest_net < 0:
-            pts = 15
-            msg = f"大单净流入持续为负：{latest_net / 10000:+,.1f} 万港元 [+{pts}分]"
-            score += pts
-            signals.append(msg)
+            # Bug 16: 累计虽负但近期 Δ 显著转买入 → 资金方向已转，不再算"持续为负"
+            if (len(big_nets) >= 2
+                    and (big_nets[0] - big_nets[1]) >= BIG_NET_DELTA_THRESHOLD):
+                flow_delta = big_nets[0] - big_nets[1]
+                signals.append(
+                    f"ℹ 大单累计 {latest_net/10000:+,.1f} 万但近期 Δ "
+                    f"{flow_delta/10000:+,.1f} 万买入，不计'持续为负'分"
+                )
+            else:
+                pts = 15
+                msg = f"大单净流入持续为负：{latest_net / 10000:+,.1f} 万港元 [+{pts}分]"
+                score += pts
+                signals.append(msg)
 
     # ── 维度 2：卖盘深度骤增（大卖单出现）──────────────────
     # 用近 K 轮中位数代替单点采样；trap_suspect 同样用近 K 轮失衡度中位数，
@@ -1244,28 +1467,11 @@ def analyze_short_entry(
     else:
         sig_type = "HOLD"
 
-    # ── Failsafe 1：摆盘明显偏多时强制降级（防底部追空）──────
-    if sig_type == "ENTRY" and current_imbalance > SHORT_TRAP_IMB_BLOCK:
-        signals.append(
-            f"⚠ 摆盘失衡度 {current_imbalance:+.3f} 明显偏多（>{SHORT_TRAP_IMB_BLOCK}），"
-            f"买盘强势，ENTRY 降级为 CAUTION 防诱空"
-        )
-        sig_type = "CAUTION"
-
-    # ── Failsafe 2：失衡度高频翻转 → 挂单博弈，禁止开空 ──────
-    # （Bug 9：2026-05-12 实盘 ENTRY=98 触发瞬间 imbalance 6 轮内翻转 3 次，
-    #  价格 1.5 分钟反弹 +1.1%。高频翻转是主力挂单/撤单博弈的特征。）
-    if sig_type == "ENTRY":
-        flip_count = db_count_imb_flips(
-            conn, SHORT_IMB_FLIP_WINDOW, SHORT_IMB_FLIP_BAND
-        )
-        if flip_count >= SHORT_IMB_FLIP_MIN:
-            reason = (f"近 {SHORT_IMB_FLIP_WINDOW} 轮失衡度极性翻转 "
-                      f"{flip_count} 次，识别为挂单博弈/操纵性信号，禁止开空")
-            db_save_signal(conn, "SHORT_IMB_FLIP_TRAP", reason, 0)
-            return 0, "BLOCKED", [reason]
-
-    return score, sig_type, signals
+    # Failsafe 1/2 抽为独立函数（Bug 18 修复）。主循环合并 support 后升级 ENTRY 时
+    # 需再次调用，否则当 analyze_short_entry 内部 score < 阈值时 failsafe 永不触发。
+    return apply_short_entry_failsafes(
+        conn, score, sig_type, current_imbalance, signals
+    )
 
 
 def analyze_short_exit(
@@ -1306,20 +1512,36 @@ def analyze_short_exit(
                 db_save_signal(conn, "SHORT_EXIT_ASK_SHRINK", msg, 65)
 
     # 3. 大单净流入强势转正
+    # Bug 13 防护：仅当价格同步突破近期高点时才视为真"主力托盘"信号。
+    # 若流入转正但价格未破高 → 可能是出货式托盘（机构接散户卖单同时
+    # 后续会继续砸盘），此时持空仓应继续观察，不应被假信号骗去止损。
     big_nets = db_get_recent_big_net(conn, 5)
     if len(big_nets) >= 3:
         recent = big_nets[:3]
         if all(v > 0 for v in recent):
-            # 加速转正更危险
-            if recent[0] > recent[1] * 1.5 and recent[1] > 0:
+            prices = db_get_recent_prices(conn, 30)
+            breakout = False
+            if len(prices) >= 10:
+                window_high = max(prices[:-3])
+                breakout = prices[-1] >= window_high * 1.002
+
+            if not breakout:
+                # 价格未破高 → 出货式托盘嫌疑，仅提示不计 urgency
+                reasons.append(
+                    f"⚠ 大单转正但价格未破近期高（{recent[0]/10000:+,.1f} 万），"
+                    f"疑似出货式托盘，持空仓继续观察"
+                )
+            elif recent[0] > recent[1] * 1.5 and recent[1] > 0:
                 urgency = max(urgency, 70)
-                msg = f"大单净流入加速转正（{recent[0]/10000:+,.1f} 万），主力托盘迹象"
+                msg = (f"大单净流入加速转正（{recent[0]/10000:+,.1f} 万）"
+                       f"且价格突破近期高，主力托盘迹象")
                 reasons.append(msg)
                 db_save_signal(conn, "SHORT_EXIT_BIGFLOW", msg, 70)
             else:
                 urgency = max(urgency, 45)
                 reasons.append(
                     f"大单净流入连续 3 轮为正（{recent[0]/10000:+,.1f} 万）"
+                    f"且价格突破近期高"
                 )
 
     # 4. 摆盘持续转多
@@ -1500,6 +1722,7 @@ class MonitorState:
     last_price:        Optional[float] = None
     latest_hkex_ratio: Optional[float] = None
     latest_big_net:    Optional[float] = None
+    recent_big_net_delta: Optional[float] = None   # 近一个 capital_flow 快照间的 Δ（约 1 分钟）
     latest_ask_depth:  Optional[float] = None
     latest_imbalance:  Optional[float] = None
     short_score:       int             = 0
@@ -1515,6 +1738,15 @@ class MonitorState:
     _prev_price:       Optional[float] = None
     _prev_big_net:     Optional[float] = None
     _stale_count:      int             = 0
+    # 大单累计单独停滞检测（Bug 14）：与上面 AND 守门并行，价格动了但大单仍冻结时，
+    # 只跳过"大单净流入"维度，其它维度照常打分
+    _prev_big_net_only:    Optional[float] = None
+    _big_net_stale_count:  int             = 0
+    # 卖空占比拐头路径锁（Bug 13）：当日首次判定走 squeeze 还是 support 后锁定，
+    # 避免 SHORT_RATIO_PRICE_CONFIRM_WIN 滚动窗口让同一事实在评分两侧反复翻转
+    _ratio_lock_date:  Optional[str]       = None  # 锁定生效日期 YYYY-MM-DD
+    _ratio_lock_key:   Optional[tuple]     = None  # (prev_ratio, latest_ratio) 元组
+    _ratio_lock_path:  Optional[str]       = None  # 'squeeze' 或 'support'
     # API 失败计数：连续失败 ≥ API_FAIL_TOLERANCE_ROUNDS 时跳过打分
     _capital_fail_count:   int         = 0
     _orderbook_fail_count: int         = 0
@@ -1570,7 +1802,7 @@ def print_dashboard(
 ║  最新价         : {str(state.last_price or 'N/A'):>10}                        ║
 ╠══════════════════════════════════════════════════════════╣
 ║  [①] HKEX 卖空占比 (今日)  : {str(state.latest_hkex_ratio or 'N/A'):>8} %  动能{str(f"{state.momentum_ratio:.2f}×" if state.momentum_ratio else "N/A"):>6}  ║
-║  [②] 大单净流入 (累计)      : {str(f"{state.latest_big_net/10000:+,.1f} 万" if state.latest_big_net is not None else "N/A"):>16}             ║
+║  [②] 大单净流入 (累计)      : {str(f"{state.latest_big_net/10000:+,.1f} 万" if state.latest_big_net is not None else "N/A"):>16}  近Δ {str(f"{state.recent_big_net_delta/10000:+,.1f}万" if state.recent_big_net_delta is not None else "—"):>9}  ║
 ║  [③] 卖盘深度               : {str(f"{state.latest_ask_depth:,.0f} 股" if state.latest_ask_depth is not None else "N/A"):>16}             ║
 ║      摆盘失衡度             : {str(f"{state.latest_imbalance:+.3f}" if state.latest_imbalance is not None else "N/A"):>8}  10日成本: {str(f"{state.weighted_cost:.1f}" if state.weighted_cost else "N/A"):>7}  ║
 ║                                              20日成本: {str(f"{state.weighted_cost_mid:.1f}" if state.weighted_cost_mid else "N/A"):>7}  ║
@@ -1688,6 +1920,12 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             if cf:
                 state.latest_big_net = cf["big_net"]
                 state._capital_fail_count = 0
+                # 近期 Δ：capital_flow 表已按 update_time 去重，相邻两行约 1 分钟跨度
+                _bn_recent = db_get_recent_big_net(conn, 2)
+                if len(_bn_recent) >= 2:
+                    state.recent_big_net_delta = _bn_recent[0] - _bn_recent[1]
+                else:
+                    state.recent_big_net_delta = None
             else:
                 state._capital_fail_count += 1
 
@@ -1734,6 +1972,23 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 time.sleep(REALTIME_INTERVAL)
                 continue
 
+            # ── 大单累计单独停滞检测（Bug 14）──────────────────────
+            # 价格在动但大单 cumulative 多轮不变 → Futu 该数值陈旧（无新大单或
+            # API 复用旧值），此时"大单净流入持续为负"维度的+15 分基于陈旧
+            # 状态，不应继续计入。其它维度（盘口/价格行为）照常打分。
+            if (state.latest_big_net is not None
+                    and state.latest_big_net == state._prev_big_net_only):
+                state._big_net_stale_count += 1
+            else:
+                state._big_net_stale_count = 0
+                state._prev_big_net_only   = state.latest_big_net
+            big_net_stale = state._big_net_stale_count >= BIG_NET_STALE_ROUNDS
+            if big_net_stale:
+                log.info(
+                    f"[大单停滞] 累计净额冻结于 {state.latest_big_net/10000:+,.1f} 万"
+                    f"已 {state._big_net_stale_count} 轮，'大单净流入'维度本轮跳过"
+                )
+
             # ── HKEX 历史卖空动能分析（日级，每轮都算）────────────
             hkex_support, hkex_squeeze_risk, hkex_sigs, hkex_stats = \
                 analyze_hkex_short_momentum(conn, state.last_price)
@@ -1744,7 +1999,7 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 state.volume_surge      = hkex_stats.get("volume_surge")
 
             # ── 逼空评分（含 HKEX 成本线风险项 + 价格反弹维度）──
-            s1, s1_support, sg1 = analyze_short_ratio_trend(conn)
+            s1, s1_support, sg1 = analyze_short_ratio_trend(conn, state)
             s2, sg2 = analyze_capital_flow(conn)
             s3, sg3 = analyze_order_book(conn, state.latest_ask_depth or 0)
             s_rev, sg_rev = analyze_price_reversal(conn, state.last_price)
@@ -1773,9 +2028,19 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 state.latest_ask_depth or 0,
                 state.latest_imbalance or 0,
                 recent_max_squeeze=recent_max_squeeze,
+                big_net_stale=big_net_stale,
             )
-            short_score = min(short_score + hkex_support + s1_support, 100)
-            short_sigs  = short_sigs + [s for s in hkex_sigs if "支撑做空" in s] + sg1_support
+            # Bug 13 防护：出货式拉升横向交叉验证（仅追加支撑分，不升级 BLOCKED/CAUTION）
+            pump_support, pump_sigs = analyze_distribution_pump(
+                conn, state.last_price, hkex_stats
+            )
+            short_score = min(
+                short_score + hkex_support + s1_support + pump_support, 100
+            )
+            short_sigs  = (short_sigs
+                           + [s for s in hkex_sigs if "支撑做空" in s]
+                           + sg1_support
+                           + pump_sigs)
             # 仅在 HOLD 时根据 HKEX 叠加分升级；BLOCKED/CAUTION 由 analyze_short_entry
             # 内的安全门和 failsafe 决定，不允许在此被覆盖回 ENTRY，避免诱空陷阱。
             if short_signal == "HOLD":
@@ -1783,6 +2048,14 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                     short_signal = "ENTRY"
                 elif short_score >= int(SHORT_ENTRY_MIN * 0.6):
                     short_signal = "CAUTION"
+            # Bug 18: 升级到 ENTRY 后必须再走一次 failsafe。analyze_short_entry 内
+            # 部基于主信号 score 判定 sig_type，当合并 support 才达到入场门槛时，
+            # 内部 sig_type 始终是 HOLD，Failsafe 1/2 永不触发 → imbalance>0.30
+            # 的极端买盘环境仍输出 ENTRY。本调用补回该检查。
+            short_score, short_signal, short_sigs = apply_short_entry_failsafes(
+                conn, short_score, short_signal,
+                state.latest_imbalance or 0, short_sigs,
+            )
             state.short_score  = short_score
             state.short_signal = short_signal
 

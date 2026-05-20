@@ -999,4 +999,108 @@ score=25, "价格自近 30 轮低点 765.50 反弹 +3.53%（当前 792.50）[+25
 
 **决策理由：** 原系统设计假设 API 永远可用、且逼空风险只通过盘口结构表现。实盘证明两者都不成立——Futu API 在 09:36-09:37 短暂中断属常态（业务时段网络抖动），而"被踏空"是做空策略最常见的失败模式，必须有专门维度捕捉。`analyze_price_reversal` 把"价格反向走势"显式纳入逼空评分，比单纯依赖卖盘/资金流的"二阶推断"更直接、更可解释。
 
-*本文档记录截止：2026-05-18。*
+## 迭代十六：拐头路径锁 + 大单单独冻结守门 + 累计大单方向感知（2026-05-20）
+
+**背景：** 2026-05-20 09:58–10:03 实盘日志暴露两个独立但叠加的缺陷，使做空入场评分在 5 分钟内从 78(ENTRY) 跳到 23(BLOCKED) 又回到 78：
+
+| 时间 | 价格 | 失衡 | 大单净 | 做空 | 逼空 | 备注 |
+|---|---|---|---|---|---|---|
+| 09:58:43 | 698.0 | +0.14 | -766.4 万 | 88(CAUTION) | 8 | 拐头 +25 走 "支撑做空" |
+| 09:59:28 | 697.5 | +0.19 | **-766.4 万** | 78(ENTRY) | 8 | 大单冻结但仍按 +15 计入 |
+| 10:00:13 | 698.0 | +0.26 | **-766.4 万** | **23(BLOCKED)** | **33** | 同一拐头事实改走 "逼空风险 +25" |
+| 10:01:14 | 698.0 | +0.55 | **-766.4 万** | 23(BLOCKED) | 33 | 大单仍冻结；"持续为负 +15" 仍在加 |
+| 10:03:45 | 701.0 | +0.67 | **-766.4 万** | 23(BLOCKED) | 33 | 大单冻结已 5 分钟 |
+
+两个具体缺陷：
+
+1. **拐头评分路径随滚动窗口翻转。** [analyze_short_ratio_trend](short_squeeze_monitor.py#L802-L885) 对"卖空占比连涨 N 日后回落"用 +25 计分，但根据 `SHORT_RATIO_PRICE_CONFIRM_WIN=30` 轮（≈7.5 min）滚动窗口的首尾价格判定走 `score`（逼空风险）还是 `support`（支撑做空）。窗口随时间滚动，价格 697.5→701.0 这一点点动作就让窗口首尾对比从"下行"翻成"上行"——**同一个 HKEX 拐头事实在评分两侧反复横跳**，每轮重新加 +25。这是日志里同一个文案 09:59 在做空支撑、10:00 出现在逼空风险的根因。
+2. **大单累计单独冻结无守门。** `STALE_DATA_ROUNDS=5` 守门的判定是 AND（价格 + 大单都不变），价格只要动 0.5 HKD 就清零计数。但 Futu `get_capital_distribution()` 返回的累计净额可以独立冻结（无新大单 / API 复用旧值），实盘大单 -766.4 万 5 分钟没动。下游 [analyze_short_entry](short_squeeze_monitor.py#L1237) 的维度 1 "大单净流入持续为负 +15" 没有"该值是否陈旧"的判定，**继续基于陈旧累计值无差别加分**。10:01:29-44 触发过两次"数据停滞"但 10:01:59 价格动了就解除，大单仍冻结、计分仍继续。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- **Fix 1（[~L802-L885](short_squeeze_monitor.py#L802-L885), [~L1636-L1644](short_squeeze_monitor.py#L1636-L1644), [~L1866](short_squeeze_monitor.py#L1866)）：** 拐头路径锁。`MonitorState` 新增 `_ratio_lock_date` / `_ratio_lock_key` / `_ratio_lock_path` 三个字段；`analyze_short_ratio_trend` 接受可选 `state` 参数，当日首次判定 (prev, latest) 元组下走哪条路径后写入锁。后续轮命中相同 (date, prev, latest) 时直接复用 `squeeze` 或 `support` 路径，文案附 "(路径锁定·当日)"。次日 HKEX 数据更新（元组变化）或日期变化时自然失效重锁。
+- **Fix 2（[~L64](short_squeeze_monitor.py#L64), [~L1641-L1642](short_squeeze_monitor.py#L1641-L1642), [~L1854-L1872](short_squeeze_monitor.py#L1854-L1872), [~L1140](short_squeeze_monitor.py#L1140), [~L1252-L1255](short_squeeze_monitor.py#L1252-L1255), [~L1894](short_squeeze_monitor.py#L1894)）：** 大单单独冻结守门。新增常量 `BIG_NET_STALE_ROUNDS=5`。`MonitorState` 加 `_prev_big_net_only` / `_big_net_stale_count`，与原 AND 守门并行追踪 `latest_big_net` 独立连续未变轮数。≥ 5 轮时主循环 `[大单停滞]` INFO 提示，并把 `big_net_stale=True` 传入 `analyze_short_entry`；维度 1 收到该 flag 时跳过整段（写入信息行 "ℹ 大单累计冻结多轮，'大单净流入'维度本轮跳过"），其它维度照常打分。
+
+**回归验证（手工心算 2026-05-20 09:58-10:03 案例）：**
+
+- 09:58:43：HKEX 拐头首次出现，价格窗口下行 → 锁 `support` 路径，做空入场支撑 +25。
+- 10:00:13：价格窗口滚动到上行；命中 `_ratio_lock_key=(16.23, 6.68)` + `_ratio_lock_date=2026-05-20` → 复用 `support` 路径，**不再切换到逼空风险**，做空评分稳定。
+- 09:58–10:03：大单从 -766.4 万开始连续未变；09:58:43→10:00:43 累积 8 轮后 `_big_net_stale_count ≥ 5` 触发 → 维度 1 (+15) 不再叠加；做空评分实际取决于价格行为 / 盘口 / 成本线，不再被陈旧大单"持续为负"持续顶高。
+
+**未改动：** `SHORT_RATIO_PRICE_CONFIRM_WIN=30`（首次判定仍使用，仅"复用"环节走锁）、`STALE_DATA_ROUNDS=5`（与新单独冻结守门并行）、安全门三元 AND（迭代十四）、`analyze_short_entry` 维度 2-5。
+
+### Fix 3：累计大单方向感知盲区（Bug 16）
+
+**背景：** 2026-05-20 10:19-10:25 实盘日志（与 Bug 14/15 同段）暴露：
+
+| 时间 | 价格 | 大单累计 | 单轮 Δ | 状态 |
+|---|---|---|---|---|
+| 10:19:54 | 698.0 | -1083.2 万 | — | 逼空 66 / 做空 23 |
+| 10:20:55 | 701.0 | -988.0 万 | **+95 万** | 逼空 53 |
+| 10:21:55 | 705.0 | -893.9 万 | **+94 万** | 逼空 48 |
+| 10:25:12 | 705.5 | -893.9 万 | 0 | 逼空 33 |
+
+近 5 分钟实际 +189 万买入 + 价格 +1.4%，**方向已转买入**，但 `analyze_short_entry` 维度 1 仅按累计静态值判"持续为负 +15"，对资金转向无感；`analyze_capital_flow` 也只看"由正转负"和"持续正值"，对"累计为负但单轮转正"完全没有维度。仪表盘 ②大单净流入 只展示静态累计，单轮 Δ 完全被淹没——用户看到"大单流出"却得到逼空风险升高的提示，理解链路断裂。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- **常量**（[~L80-L84](short_squeeze_monitor.py#L80-L84)）：新增 `BIG_NET_DELTA_THRESHOLD=500_000`（单轮 Δ ≥ 50 万港元算显著买入）、`BIG_NET_REBUY_PRICE_PCT=0.3`（同期价格涨幅 ≥ 0.3% 算方向咬合）。
+- **State**（[~L1631](short_squeeze_monitor.py#L1631)）：`recent_big_net_delta` 字段存近一个 capital_flow 快照间 Δ（约 1 分钟）。`capital_flow` 表已按 `update_time` 去重（Bug 5 修复），相邻两行天然跨 1 分钟，`db_get_recent_big_net(conn, 2)` 取首尾差就是真实 Δ。
+- **主循环**（[~L1867-L1872](short_squeeze_monitor.py#L1867-L1872)）：`cf` 成功后查 `_bn_recent = db_get_recent_big_net(conn, 2)`，写入 `state.recent_big_net_delta`。
+- **Dashboard**（[~L1701](short_squeeze_monitor.py#L1701)）：②大单净流入 行后追加 "近Δ ±XX.X万"，让"累计静态值"和"近期方向"并排可见。
+- **`analyze_capital_flow`**（[~L676-L696](short_squeeze_monitor.py#L676-L696)）：新增分支——`recent[0] < 0` 且 `recent[0] - recent[1] >= THRESHOLD` 且近 8 轮价格涨幅 ≥ 0.3% 时，落 +10 逼空风险分 + `BIG_FLOW_REBUY` DB 信号，文案 "大单累计 X 万仍为负但近期 Δ +Y 万买入，价格 +Z% 咬合 → 空头回补/多头进场"。
+- **`analyze_short_entry` 维度 1**（[~L1287-L1297](short_squeeze_monitor.py#L1287-L1297)）：`elif latest_net < 0` 分支前置检查近期 Δ；若 `big_nets[0] - big_nets[1] >= THRESHOLD` 则不计 "持续为负 +15"，改输出说明行 "ℹ 大单累计 X 万但近期 Δ +Y 万买入，不计'持续为负'分"。其它维度照常打分。
+
+**回归验证（手工心算 2026-05-20 10:19-10:25 案例）：**
+
+- 10:20:55 这一轮：`recent=[-988万, -1083.2万]`，`Δ = +95.2 万 ≥ 50 万`；近 8 轮价格 698→701，涨幅 +0.43% ≥ 0.3% → 触发 `BIG_FLOW_REBUY` +10 逼空风险分，文案展示资金方向转向。
+- 同轮 `analyze_short_entry` 维度 1：检测 `Δ +95.2 万`，跳过 +15"持续为负"，转写说明行；做空入场评分降低（不再被陈旧累计静态值顶高）。
+- Dashboard ②：`-988.0 万   近Δ +95.2万`，两个数字并排，用户一眼看到"累计虽负但近期在买"。
+
+**未改动：** `BIGFLOW_REVERSAL_MIN=2`、`BIGFLOW_WINDOW=10`、Bug 13 出货式拉升检测（流入持续正 + 价格停滞 → 不计分）、`analyze_short_entry` 维度 2-5。
+
+**决策理由：**
+- **累计静态值是滞后量**。 日内累计混了早盘大额、午前波动、近 5 分钟实际成交，靠它判方向必然滞后。"近期 Δ + 价格咬合" 是真实方向的最简近似。
+- **方向矩阵替代单维度判定**。 大单方向 × 价格方向有 4 种组合（详见 [[known_bugs_and_gotchas]] Bug 16 条目），单看大单或单看价格都会被反向利用。本 Fix 把"累计负 + 单轮转正 + 价格涨"建模成显式维度，与 Bug 13 待修的"累计正 + 价格停滞 = 出货式拉升" 对称——同一个矩阵的另一格。
+- **仪表盘必须展示"评分用的真实量"**。 评分用近期 Δ，仪表盘也得展示近期 Δ；不能评分用一个数、展示另一个数，否则用户永远不能验证评分的合理性。
+
+### Fix 4：Failsafe 1/2 被 support 升级绕过（Bug 18）
+
+**背景：** 2026-05-20 13:36-13:42 实盘日志，连续 7 分钟做空入场显示 63-78(ENTRY)，但 imbalance 整段稳定在 **+0.92 ~ +0.97**（极端买盘强势，远超 `SHORT_TRAP_IMB_BLOCK=0.30`），按 Bug 6 设计应强制降级 CAUTION 防底部追空，但实际整段没降级。
+
+| 时间 | 价格 | imb | 大单累计 | 做空 |
+|---|---|---|---|---|
+| 13:36:08 | 693.5 | +0.918 | -1811 万（冻结开始）| **78(ENTRY)** |
+| 13:36:23 | 693.5 | +0.924 | -1811 万（冻结跳过）| 63(ENTRY) |
+| 13:39:55 | 696.0 | +0.598 | -1811 万 | 63(ENTRY) |
+| 13:40:40 | 694.0 | +0.946 | -1811 万 | **73(ENTRY)** |
+| 13:42:11 | 693.0 | +0.956 | -1915 万（Δ-104万）| 48(BLOCKED·逼空 33) |
+
+**根因（评分汇合链路）：**
+
+1. `analyze_short_entry` 内部 `score` 只计维度 1-5 的主信号分。Bug 14 修复后维度 1 在大单冻结时跳过 → 维度 1=0、维度 2/3/5=0、维度 4 价格跌 +15 → `score=15`。
+2. `sig_type` 由内部 score 判定：`15 < 33 → HOLD`。
+3. [Failsafe 1（line 1428）](short_squeeze_monitor.py#L1428): `if sig_type == "ENTRY" and current_imbalance > 0.30` → sig_type 是 HOLD，**永不触发**。
+4. 主循环 [line 2011-2024](short_squeeze_monitor.py#L2011-L2024) 把 `short_score = 15 + hkex_support(23) + s1_support(25) = 63`，HOLD 升级 ENTRY。
+5. 升级后**不再回头检查 imbalance**，Failsafe 1/2 完全被绕过。
+
+**变更内容（`short_squeeze_monitor.py`）：**
+
+- **抽出 [apply_short_entry_failsafes](short_squeeze_monitor.py#L1197-L1238)：** Failsafe 1/2 从 `analyze_short_entry` 内部抽为独立函数，签名 `(conn, score, sig_type, imbalance, signals) -> (score, sig_type, signals)`，BLOCKED 时丢弃 signals 只保留 reason（与原 in-place 行为一致）。
+- **`analyze_short_entry` 末尾**（[~L1486](short_squeeze_monitor.py#L1486)）：替换原内联 Failsafe 1/2 为 `return apply_short_entry_failsafes(...)`，行为不变。
+- **主循环 ENTRY 升级后**（[~L2030-L2037](short_squeeze_monitor.py#L2030-L2037)）：合并 hkex/s1/pump 支撑分并升级 ENTRY 后，再次调用 `apply_short_entry_failsafes(conn, short_score, short_signal, state.latest_imbalance, short_sigs)`，让"被升级到 ENTRY"也经历同样的诱空保护。
+
+**回归验证（手工心算 2026-05-20 13:36:08 案例）：**
+
+- `analyze_short_entry` 返回 `(score=15, sig_type=HOLD, signals=[价格跌 +15])`，Failsafe 1 因 sig_type=HOLD 不触发。
+- 主循环 `short_score = 15+23+25 = 63 ≥ 55`，HOLD 升级 ENTRY。
+- 调用 `apply_short_entry_failsafes(conn, 63, "ENTRY", +0.918, signals)` → Failsafe 1 检测 `+0.918 > 0.30`，sig_type 降级 CAUTION，附加"⚠ 摆盘失衡度 +0.918 明显偏多 …"。
+- 最终输出：做空 63(**CAUTION**) 而非 63(ENTRY) ✓
+
+**未改动：** Failsafe 1/2 阈值（`SHORT_TRAP_IMB_BLOCK=0.30`、`SHORT_IMB_FLIP_WINDOW=6` / `SHORT_IMB_FLIP_MIN=2` / `SHORT_IMB_FLIP_BAND=0.10`）、`SHORT_ENTRY_MIN=55`、"仅在 HOLD 时升级"的合并规则（Bug 6）。
+
+**决策理由：**
+- **failsafe 必须紧贴最终 sig_type，而不是 in-flight 状态**。原设计假设 sig_type 在 analyze_short_entry 内已经定型，主循环只是搬运；实际加了 support 合并后，sig_type 在主循环阶段才定型，failsafe 也必须跟到这里。
+- **support 合并应保留 score 来源信息但不改变保护机制**。把 score 拆成"主信号 + support"是为了让"卖空占比高位拐头"等日级背景分参与最终评分，但保护机制（防底部追空、防挂单博弈）只看终态环境，不区分 score 来源——因此 failsafe 必须在终态上重跑。
+
+*本文档记录截止：2026-05-20。*
