@@ -34,5 +34,12 @@ STOCKS: dict = {
         "db_path":       "short_data_06082.db",
         "poll_interval": 30,
     },
+    "06656": {
+        "symbol":        "HK.06656",
+        "stock_code":    "06656",
+        "name":          "思格新能",
+        "db_path":       "short_data_06656.db",
+        "poll_interval": 30,
+    },
 }
 DEFAULT_STOCK = "00100"

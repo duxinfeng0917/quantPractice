@@ -1726,6 +1726,8 @@ class MonitorState:
     latest_ask_depth:  Optional[float] = None
     latest_imbalance:  Optional[float] = None
     short_score:       int             = 0
+    main_signal_score: int             = 0   # 主信号分（维度 1-5），反映"此刻"盘面
+    support_score:     int             = 0   # 日级背景分（HKEX + 成本线 + pump），整日基本固定
     short_signal:      str             = "HOLD"
     exit_urgency:      int             = 0
     weighted_cost:     Optional[float] = None   # 空头10日加权成本线
@@ -1814,8 +1816,11 @@ def print_dashboard(
         for s in squeeze_signals:
             print(f"║   ⚠ {s[:52]:<52}  ║")
 
+    # Bug 19：拆分展示做空总分 = 主信号（盘中此刻）+ 日级背景（整日固定）
+    # 用户应关注主信号分，避免被日级地板 48 分顶高的总分误导
+    score_split = f"主{state.main_signal_score:2d} + 背景{state.support_score:2d}"
     print(f"""╠══════════════════════════════════════════════════════════╣
-║  【做空入场】[{bar(short_score)}] {short_score:3d}/100        ║
+║  【做空入场】[{bar(short_score)}] {short_score:3d}/100  ({score_split})  ║
 ║  {signal_label:<52}  ║""")
 
     if short_sigs:
@@ -2034,9 +2039,10 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             pump_support, pump_sigs = analyze_distribution_pump(
                 conn, state.last_price, hkex_stats
             )
-            short_score = min(
-                short_score + hkex_support + s1_support + pump_support, 100
-            )
+            # 拆分展示（Bug 19）：主信号分（维度 1-5）vs 日级背景分（HKEX + 成本线 + pump）
+            main_signal_score = short_score   # analyze_short_entry 返回的就是主信号分
+            support_score = hkex_support + s1_support + pump_support
+            short_score = min(main_signal_score + support_score, 100)
             short_sigs  = (short_sigs
                            + [s for s in hkex_sigs if "支撑做空" in s]
                            + sg1_support
@@ -2058,6 +2064,8 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             )
             state.short_score  = short_score
             state.short_signal = short_signal
+            state.main_signal_score = main_signal_score
+            state.support_score     = support_score
 
             # ── 写入共享评分供 paper_trader 读取 ─────────────────
             db_write_monitor_state(
