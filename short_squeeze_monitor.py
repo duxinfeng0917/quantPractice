@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from shared_config import HKEX_COST_WINDOW, STOCKS, DEFAULT_STOCK
 
+import math
+
 import requests
 import pandas as pd
 from futu import OpenQuoteContext, SubType, RET_OK, Market
@@ -85,6 +87,12 @@ BIGFLOW_STREAK_WINDOW = 120       # streak 计数窗口；与 BIGFLOW_WINDOW 解
 # capital_flow 表已按 update_time 去重，相邻两行约 1 分钟跨度，故 recent[0]-recent[1] 就是近 1 分钟 Δ
 BIG_NET_DELTA_THRESHOLD = 500_000  # 单轮 Δ ≥ 50 万港元才算显著买入（小于此值视为噪音）
 BIG_NET_REBUY_PRICE_PCT = 0.3      # 同期价格涨幅 ≥ 此 % 才视为方向咬合（防纯撤单噪音）
+# Bug 20：出货式拉升检测的前置守门——已涨完才停滞 ≠ 出货
+BIGFLOW_PUMP_STAGNANT_PCT = 0.3    # 近期窗口涨幅 < 此 % 视为停滞
+BIGFLOW_PUMP_INTRADAY_MIN = 2.0    # 但日内累计涨幅 ≥ 此 % 时，停滞解释为高位整理而非出货
+# Bug 21：日内已涨但价格已从近期高点回落 → 真出货（Bug 20 的反例边界）
+BIGFLOW_PUMP_PEAK_PULLBACK_PCT = 1.5  # 从近 N 轮峰值回落 ≥ 此 % 视为顶部已现，覆盖 Bug 20 路径
+BIGFLOW_PUMP_PEAK_WINDOW = 30        # 近期峰值参考窗口（轮次，约 7.5 分钟）
 
 # 做空信号阈值
 SHORT_SAFE_SQUEEZE   = 25         # 逼空评分超过此值时禁止新开空单
@@ -287,16 +295,21 @@ def db_get_recent_big_net(conn: sqlite3.Connection, n: int) -> list[float]:
 
 
 def db_save_price(conn: sqlite3.Connection, ts: str, price: float):
+    # 拒绝 0/None/NaN：Futu 网络异常时 last_price 偶尔会回 0，会污染下游所有价差计算
+    if price is None or not math.isfinite(price) or price <= 0:
+        log.warning(f"[价格异常] 拒绝写入 price={price!r} @ {ts}")
+        return
     conn.execute("INSERT INTO price_history VALUES (NULL,?,?)", (ts, price))
     conn.commit()
 
 
 def db_get_recent_prices(conn: sqlite3.Connection, n: int) -> list[float]:
-    """返回最近 n 轮价格，最新在后（时间升序）。"""
+    """返回最近 n 轮价格，最新在后（时间升序）。过滤掉 0/None 历史脏值。"""
     rows = conn.execute(
         "SELECT price FROM price_history ORDER BY id DESC LIMIT ?", (n,)
     ).fetchall()
-    return [r[0] for r in reversed(rows)]
+    return [r[0] for r in reversed(rows)
+            if r[0] is not None and r[0] > 0 and math.isfinite(r[0])]
 
 
 def db_get_session_high(conn: sqlite3.Connection,
@@ -309,6 +322,19 @@ def db_get_session_high(conn: sqlite3.Connection,
     """
     row = conn.execute(
         "SELECT MAX(price) FROM price_history WHERE ts >= ?", (since_ts,)
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def db_get_session_low(conn: sqlite3.Connection,
+                       since_ts: str) -> Optional[float]:
+    """返回 since_ts (含) 之后所有价格的最小值；无数据时返回 None。
+
+    与 session_high 对称——出货式拉升检测需用日内 anchor 衡量已实现涨幅，
+    避免滑动窗口在主升浪后被自身拉高导致 0 涨幅的假象。
+    """
+    row = conn.execute(
+        "SELECT MIN(price) FROM price_history WHERE ts >= ? AND price > 0", (since_ts,)
     ).fetchone()
     return row[0] if row and row[0] is not None else None
 
@@ -642,15 +668,67 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
         # 仅 777 → 796.5（+2.5% 后无法突破日高 827.5），次日跳空 -8%。机构
         # 在用大买单接散户卖单出货 —— 统计上"主动买入"但实际是出货。
         # 故当流入持续正值而同期价格停滞（< 0.3%）时，不计逼空风险分。
+        #
+        # Bug 20 反向修正（2026-05-26）：主升浪后的高位整理也会"局部停滞"
+        # 但日内累计已大涨，是真逼空不是出货。改为同时核查日内累计涨幅：
+        #   局部停滞 + 日内大涨 → 高位整理（仍计分）
+        #   局部停滞 + 日内未涨 → 真出货式拉升（不计分）
+        #
+        # Bug 21 边界修复（2026-05-26）：日内涨幅是滞后指标。当价格已从近期
+        # 高点回落时，"日内已涨"仍成立但盘面方向已逆转——机构在高位接散户卖单。
+        # 5/26 14:00 实盘：价格 836→806（-3.7%），大单累计仍 +810 万。
+        # 加第三道守门：从近 N 轮峰值回落 ≥ 1.5% → 顶部已现，覆盖 Bug 20 路径。
         sync_window = min(streak, 30)
         sync_prices = db_get_recent_prices(conn, sync_window)
         price_pct = 0.0
-        if len(sync_prices) >= 5:
+        have_sync = len(sync_prices) >= 5 and sync_prices[0] > 0
+        if have_sync:
             price_pct = (sync_prices[-1] - sync_prices[0]) / sync_prices[0] * 100
 
-        if len(sync_prices) >= 5 and price_pct < 0.3:
-            msg = (f"⚠ 大单净流入持续 {streak} 轮但价格 {price_pct:+.2f}%"
-                   f"（近 {sync_window} 轮停滞），疑似出货式拉升，不计逼空分")
+        current_close = sync_prices[-1] if sync_prices else None
+        session_low_anchor = db_get_session_low(
+            conn, datetime.date.today().isoformat()
+        )
+        intraday_gain = 0.0
+        if (current_close is not None
+                and session_low_anchor is not None
+                and session_low_anchor > 0):
+            intraday_gain = (current_close - session_low_anchor) \
+                            / session_low_anchor * 100
+
+        # Bug 21：近期峰值回落核查（独立窗口，不复用 sync_window 以保证语义稳定）
+        peak_window_prices = db_get_recent_prices(conn, BIGFLOW_PUMP_PEAK_WINDOW)
+        pullback_from_peak = 0.0
+        if (current_close is not None and len(peak_window_prices) >= 5):
+            recent_peak = max(peak_window_prices)
+            if recent_peak > 0:
+                pullback_from_peak = (recent_peak - current_close) \
+                                     / recent_peak * 100
+
+        is_local_stagnant = have_sync and price_pct < BIGFLOW_PUMP_STAGNANT_PCT
+        is_intraday_rallied = intraday_gain >= BIGFLOW_PUMP_INTRADAY_MIN
+        is_pulled_back_from_peak = (
+            pullback_from_peak >= BIGFLOW_PUMP_PEAK_PULLBACK_PCT
+        )
+
+        # 三元判断：
+        #   停滞 + 日内未涨           → 真出货（Bug 13 旧路径）
+        #   停滞 + 日内已涨 + 已回落  → 真出货（Bug 21 新路径，顶部出货）
+        #   停滞 + 日内已涨 + 未回落  → 高位整理（Bug 20 路径）
+        is_distribution_suspect = is_local_stagnant and (
+            not is_intraday_rallied or is_pulled_back_from_peak
+        )
+
+        if is_distribution_suspect:
+            if is_intraday_rallied and is_pulled_back_from_peak:
+                # Bug 21 文案：明确指出"已从近期峰值回落"
+                msg = (f"⚠ 大单净流入持续 {streak} 轮但价格已从近 "
+                       f"{BIGFLOW_PUMP_PEAK_WINDOW} 轮峰值回落 "
+                       f"{pullback_from_peak:.2f}%，疑似顶部出货，不计逼空分")
+            else:
+                # Bug 13 原文案：低位停滞
+                msg = (f"⚠ 大单净流入持续 {streak} 轮但价格 {price_pct:+.2f}%"
+                       f"（近 {sync_window} 轮停滞），疑似出货式拉升，不计逼空分")
             signals.append(msg)
             db_save_signal(conn, "BIGFLOW_PUMP_SUSPECT", msg, 0)
         else:
@@ -662,7 +740,13 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
                 pts = 5
             else:
                 pts = 3
-            msg = f"大单净流入持续正值 {streak} 轮 [+{pts}分]"
+            if is_local_stagnant and is_intraday_rallied:
+                # Bug 20 路径：局部停滞但日内已涨且未从峰值回落，是真高位整理
+                msg = (f"大单净流入持续正值 {streak} 轮"
+                       f"（日内已涨 {intraday_gain:+.1f}%，"
+                       f"近 {sync_window} 轮高位整理 {price_pct:+.2f}%）[+{pts}分]")
+            else:
+                msg = f"大单净流入持续正值 {streak} 轮 [+{pts}分]"
             score += pts
             signals.append(msg)
 
@@ -684,7 +768,7 @@ def analyze_capital_flow(conn: sqlite3.Connection) -> tuple[int, list[str]]:
             and (recent[0] - recent[1]) >= BIG_NET_DELTA_THRESHOLD):
         flow_delta = recent[0] - recent[1]
         sync_prices = db_get_recent_prices(conn, 8)
-        if len(sync_prices) >= 5:
+        if len(sync_prices) >= 5 and sync_prices[0] > 0:
             price_pct = (sync_prices[-1] - sync_prices[0]) / sync_prices[0] * 100
             if price_pct >= BIG_NET_REBUY_PRICE_PCT:
                 pts = 10
@@ -897,7 +981,8 @@ def analyze_short_ratio_trend(
                 signals.append(msg)
         else:
             prices = db_get_recent_prices(conn, SHORT_RATIO_PRICE_CONFIRM_WIN)
-            price_uptrend = len(prices) < 5 or prices[-1] >= prices[0]
+            have_prices = len(prices) >= 5 and prices[0] > 0
+            price_uptrend = (not have_prices) or prices[-1] >= prices[0]
             chosen_path = "squeeze" if price_uptrend else "support"
 
             if price_uptrend:
@@ -1280,7 +1365,7 @@ def analyze_short_entry(
         prices = db_get_recent_prices(conn, SHORT_BLOCK_OVERRIDE_WIN)
         price_confirmed_down = False
         price_move_pct = 0.0
-        if len(prices) >= 5:
+        if len(prices) >= 5 and prices[0] > 0:
             price_move_pct = (prices[-1] - prices[0]) / prices[0] * 100
             price_confirmed_down = price_move_pct <= -SHORT_BLOCK_PRICE_DROP_PCT
 
@@ -1916,9 +2001,13 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             # ── 获取最新价格并存入历史 ─────────────────────────────
             ret_q, qdata = ctx.get_stock_quote(code_list=[SYMBOL])
             if ret_q == RET_OK and not qdata.empty:
-                state.last_price = float(qdata.iloc[0]["last_price"])
-                db_save_price(conn, now.isoformat(timespec="seconds"),
-                              state.last_price)
+                _lp = float(qdata.iloc[0]["last_price"])
+                # Futu 网络抖动时 last_price 偶尔回 0/NaN，直接丢弃本轮报价
+                if math.isfinite(_lp) and _lp > 0:
+                    state.last_price = _lp
+                    db_save_price(conn, now.isoformat(timespec="seconds"), _lp)
+                else:
+                    log.warning(f"[报价异常] last_price={_lp!r}，跳过本轮价格更新")
 
             # ── 信号②：资金流向 ───────────────────────────────────
             cf = fetch_capital_flow(ctx, conn)
