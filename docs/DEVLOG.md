@@ -1988,4 +1988,137 @@ sig_type==ENTRY  AND  big_net_stale  AND  current_price 上行
 
 ---
 
+## 迭代三十：L2 逐笔冰山检测 Tier 1（执行级被动吸筹/派发，2026-06-04）
+
+### 背景
+
+迭代二十九的 `analyze_sell_no_drop` 用「资金流 × 价格」背离判被动吸筹，但资金流
+（`get_capital_distribution`）每分钟才刷新一次、且仍是 aggressor 累计——分不开"被动
+吸筹"与"真出货"的根因（两者都显示为流出）只能靠价格裁决。要真正穿透，必须下沉到
+**逐笔成交**：报价层（挂单深度/集中度）是 spoofing 重灾区（00981 06-04 卖深
+500↔135,500 来回甩），唯有"真金白银吃出来的成交"难造假。
+
+评估外部 AI 提的 L2 方案后定调：**它把优先级押反了**——主打"前三档挂单集中度"恰是最
+可幌单的一层，`bid_conc>0.65 → +吸筹分` 会被假接货墙直接骗出诱多。正确做法是信成交
+（execution）、不信报价（quote）。用户确认 Futu 订阅含 TICKER + BROKER，先落地 Tier 1。
+
+### 改动（`short_squeeze_monitor.py`）
+
+新增 **`analyze_iceberg_absorption()`（五-D3）** + 逐笔数据管道：
+
+```
+买侧冰山吸筹：主动卖主导(SELL≥BUY×DOMINANCE) + 价格未跟跌(≥PRICE_FLOOR)
+  + 买一被吃量 ≥ 显示量×REFILL_MULT(补单铁证) → squeeze +15(强)/+8(弱)，抑制追空
+卖侧冰山派发：主动买主导(BUY≥SELL×DOMINANCE) + 价格滞涨(≤PRICE_CAP)
+  + 卖一被吃量 ≥ 显示量×REFILL_MULT → support做空 +15/+8
+```
+
+- **数据层**：订阅加 `SubType.TICKER`；新 `fetch_ticks()` 拉 `get_rt_ticker`、按
+  `sequence` 去重只统计新成交、聚合主动买/卖量（Futu `ticker_direction` BUY=主动买/
+  SELL=主动卖），结合 `fetch_order_book` 新带出的最优档显示量，写入新表 `tick_flow`。
+  逐笔是增强信号，失败仅 None、不阻断核心打分（不进 API 失效守门）。
+- **新常量**：`ICEBERG_WINDOW=4`、`MIN_VOL=50_000股`、`DOMINANCE=1.5`、
+  `PRICE_FLOOR=-0.10%`、`PRICE_CAP=0.10%`、`REFILL_MULT=2.0`、`STRONG=15`、`WEAK=8`、
+  `TICK_FETCH_NUM=1000`。
+- **接线**：返回 `(squeeze_pts, support_pts, sigs)` 双路由——吸筹喂 `squeeze_score`
+  （经安全门 BLOCK 追空，与 s_snd 同侧），派发喂 `support_score`（支撑做空）；二者按价格
+  方向互斥，单轮最多一个非零。
+- **DB 幂等**：`tick_flow` 经 `CREATE TABLE IF NOT EXISTS` 加表，存量库（短库 40093 行
+  capital_flow）已验证无损。
+
+### 验证
+
+- `py_compile` 通过；`init_db` 对存量真库幂等加表、原数据无损。
+- **合成单测 6 例全过**（真逐笔数据需下个交易时段实盘采集，本迭代上线前无历史 tick 可回放）：
+  吸筹→(15,0)、派发→(0,15)、中性→(0,0)、**主动卖主导但价跟跌→(0,0)正确判真砸盘不误报**、
+  量不足→(0,0)、窗口不足→(0,0)。
+
+### 为什么不采纳"挂单集中度"主打方案
+
+显示挂单是最易操纵层；集中度加分会重新引入刚在 `analyze_sell_no_drop` 躲掉的 spoofing
+漏洞。集中度/委托笔数仅宜作**交叉验证或识别幌单**，绝不单独加分。Tier 2（经纪队列：
+单一席位反复补买一=机构足迹）与 Tier 3（委托笔数）待后续按需补。
+
+### 未改动
+
+- 迭代二十二~二十九各维度、Failsafe 1-4、安全门通道 A/B/C 全部保留。
+- 真逐笔阈值（`ICEBERG_MIN_VOL` 等股数）与本档成交活跃度强相关，换标的必须重标定；
+  极活跃标的两次轮询间成交 > 1000 笔会少计量级（不影响方向判定）。
+
+---
+
+## 迭代三十一：L2 经纪队列足迹 Tier 2（机构席位足迹交叉验证，2026-06-04）
+
+### 背景
+
+迭代三十 Tier 1 用逐笔成交（execution）穿透 aggressor 二义性，落地后留 Tier 2/3「待按需补」。
+Tier 2 = 经纪队列：`get_broker_queue` 暴露**哪个经纪席位**在买一/卖一档排队。单一席位反复
+占据并补回最优档 = 机构被动挂单的足迹（散户做不到这种持续性）。
+
+**关键定位（务必记住）**：经纪队列是**报价层（quote）**，与挂单深度同属 spoofing 重灾区。
+故 Tier 2 **绝不单独加分**——只在 Tier-1 冰山（执行级成交证据）同向已触发时作交叉验证加成。
+否则就重新引入了刚在 `analyze_sell_no_drop`/Tier-1 躲掉的"假接货墙骗诱多"漏洞。
+
+### 改动（`short_squeeze_monitor.py`）
+
+新增 **`analyze_broker_footprint()`（五-D4）** + 经纪队列数据管道：
+
+```
+ice_squeeze_pts<=0 AND ice_support_pts<=0 → 直接 (0,0,[])   ← 反幌单铁律：无冰山不计分
+买侧：Tier-1 买侧冰山吸筹已触发 + 单一 bid1 席位 ≥MIN_ROUNDS/WINDOW 占据 → squeeze +BONUS
+卖侧：Tier-1 卖侧冰山派发已触发 + 单一 ask1 席位 ≥MIN_ROUNDS/WINDOW 占据 → support +BONUS
+```
+
+- **数据层**：订阅加 `SubType.BROKER`；新 `fetch_broker_queue()` 拉 `get_broker_queue`
+  （返回 `(ret, bid_frame, ask_frame)`），取每侧队首行 `broker_id` 写入新表 `broker_queue`。
+  报价层增强信号，失败仅 None、不阻断核心打分（不进 API 失效守门）。
+- **新常量**：`BROKER_FOOTPRINT_WINDOW=6`、`MIN_ROUNDS=4`、`BONUS=6`。
+- **接线**：`analyze_broker_footprint(conn, s_ice_sq, s_ice_sup)` 紧跟冰山调用；`s_brk_sq`
+  并入 `squeeze_score`（与冰山吸筹同侧）、`s_brk_sup` 并入 `support_score`。非冰山轮恒零。
+- **席位过滤**：None/空/`"0"`（隐藏/未披露）席位剔除，避免把"无席位"当持续足迹。
+- **DB 幂等**：`broker_queue` 经 `CREATE TABLE IF NOT EXISTS` 加表，00981 真库（4060 行
+  capital_flow）已验证幂等加表、原数据无损。
+
+### 验证
+
+- `py_compile` 通过；真库幂等加表无损。
+- **合成单测 6 例全过**（真经纪数据需下个交易时段采集，本迭代无历史 broker 可回放）：
+  席位占据+冰山吸筹→(6,0)、**席位占据但无冰山→(0,0) 反幌单铁律生效**、席位不持续→(0,0)、
+  卖侧席位+冰山派发→(0,6)、窗口不足→(0,0)、隐藏席位被过滤→(0,0)。
+
+### ⚠ LV1 实盘核对 + 订阅原子失败修复（2026-06-04 11:38 盘中）
+
+实盘连 OpenD 测试（00981，账户 **LV1 行情权限**）暴露：
+
+1. **Tier-1 TICKER 在 LV1 完全可用**：`get_rt_ticker` 返回真实 `ticker_direction`(BUY/SELL/
+   NEUTRAL)+`sequence`，逐笔冰山数据源没问题。`get_order_book` 在 LV1 仅返回买卖各 1 档，
+   但冰山只需 best_bid/ask_vol（第 0 档），不受影响。
+2. **Tier-2 BROKER 在 LV1 不支持**：`get_broker_queue` 报「LV1 权限下不支持获取经纪队列」，
+   需 LV2 权限。Tier-2 在本账户上常驻降级，待用户升 LV2 才生效。
+3. **真 bug（本次引入并修复）**：原把 `SubType.BROKER` 并进核心 subscribe 一批 →
+   **LV1 下整批原子失败**（ret=-1），连 QUOTE/ORDER_BOOK/TICKER 都订不上，直接拖垮
+   Tier-1。**修复**：BROKER 拆成独立 `subscribe` 调用，`broker_available` 标记其成败；
+   主循环 `if broker_available: fetch_broker_queue(...)` 门控，失败则降级为纯 Tier-1。
+   实测：核心订阅 OK、逐笔流动正常、`broker_queue` 恒 0 行、`analyze_broker_footprint`
+   返回 (0,0) 不崩——优雅降级成立。详见 [[known-bugs-and-gotchas]]。
+4. **当日升 L2 后 Tier-2 实盘跑通**（13:40）：BROKER 订阅 ret=0、`get_broker_queue` 返回
+   `(ret, bid_frame, ask_frame)`，**列名核对为 `bid_broker_id`/`ask_broker_id`**（与
+   `fetch_broker_queue` 一致，无需改码），`iloc[0]`=队首席位；`broker_queue` 逐轮入库、
+   `analyze_broker_footprint` 在真席位序列上正确计算（窗口内无单一席位达 4/6 → 即便强制
+   冰山旗标仍 (0,0)，无误报）；订单簿升 10 档。`MIN_ROUNDS`/`BONUS` 待真实机构吸筹案例标定。
+
+### 为什么 Tier 2 只能加成、不能独立
+
+显示挂单/经纪席位都可幌单；若让席位足迹独立计分，假接货墙挂个常驻席位即可骗出吸筹诱多。
+Tier-1 冰山的"成交被吸收 + 补单铁证"是真金白银，Tier 2 在其之上确认"是同一机构在做"——
+方向由 Tier-1 定，Tier 2 只提升置信度（+6）。Tier 3（委托笔数）同理，待按需补。
+
+### 未改动
+
+- 迭代二十二~三十各维度、Failsafe 1-4、安全门通道 A/B/C 全部保留。
+- 真席位阈值与标的活跃度/做市结构相关，换标的需观察重标定；`get_broker_queue` 仅 HK 等
+  披露经纪队列的市场可用，未订阅/不可用时静默降级为纯 Tier-1。
+
+---
+
 *本文档记录截止：2026-06-04。*

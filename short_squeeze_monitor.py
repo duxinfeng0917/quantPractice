@@ -167,6 +167,28 @@ SELL_NO_DROP_WINDOW       = 8            # 回看窗口（capital_flow 行数，
 SELL_NO_DROP_MIN_OUTFLOW  = -3_000_000  # 窗口内 (大单+中单) Δ ≤ 此值视为持续净流出（HKD）
 SELL_NO_DROP_PRICE_FLOOR  = -0.10       # 同期价格涨幅 ≥ 此 % 视为"未跟跌"（守位/反弹）
 SELL_NO_DROP_SCORE        = 12          # 抬升逼空风险分（喂做空安全门，BLOCK 顺势追空）
+# ─────────────────────────────────────────────────────────
+# L2 逐笔冰山检测（Tier 1，2026-06-04）——用成交(execution)而非报价(quote)分辨被动吸筹/派发
+# 报价层（挂单深度/集中度）是 spoofing 重灾区（00981 06-04 卖深 500↔135,500 来回甩），
+# 故只信"真金白银吃出来的成交"：主动卖量大但价不跌 + 买一被吃量远超显示量 = 买侧冰山吸筹；
+# 主动买量大但价滞涨 + 卖一被吃量远超显示量 = 卖侧冰山派发。需订阅 SubType.TICKER。
+# 量阈值（股）与本档成交活跃度强相关，换标的（尤其低价/小成交股）必须重标定。
+ICEBERG_WINDOW          = 4          # 回看 tick_flow 行数（每行≈一个轮询窗口的聚合）
+ICEBERG_MIN_VOL         = 50_000     # 窗口内主导方主动成交量 ≥ 此值才评估（股）
+ICEBERG_DOMINANCE       = 1.5        # 一方主动量 ≥ 另一方 × 此倍数 视为单边主导
+ICEBERG_PRICE_FLOOR     = -0.10      # 吸筹：同期价格涨幅 ≥ 此 %（未跟跌）
+ICEBERG_PRICE_CAP       = 0.10       # 派发：同期价格涨幅 ≤ 此 %（滞涨）
+ICEBERG_REFILL_MULT     = 2.0        # 被动方成交量 ≥ 最优档显示量 × 此倍数 → 冰山补单（执行级铁证）
+ICEBERG_STRONG_SCORE    = 15         # 冰山补单确认（强：显示量被反复吃穿仍补回）
+ICEBERG_WEAK_SCORE      = 8          # 仅"成交被吸收价不动"（弱：无补单铁证）
+ICEBERG_TICK_FETCH_NUM  = 1000       # get_rt_ticker 单次拉取上限（Futu 上限，去重靠 sequence）
+# L2 经纪队列足迹（Tier 2，2026-06-04）——单一经纪席位反复占据最优档=机构被动挂单足迹。
+# 报价层可幌单（00981 06-04 卖深 500↔135,500 来回甩），故经纪足迹**绝不单独加分**：
+# 仅当 Tier-1 冰山（执行级成交证据）同向已触发时，作为交叉验证加成抬升置信度。
+# 买一侧单一席位持续占据 → 确认吸筹；卖一侧 → 确认派发。需订阅 SubType.BROKER。
+BROKER_FOOTPRINT_WINDOW     = 6   # 回看 broker_queue 行数（每行≈一个轮询）
+BROKER_FOOTPRINT_MIN_ROUNDS = 4   # 同一 broker_id 占据最优档 ≥ 此轮数（窗口内）视为持续足迹
+BROKER_FOOTPRINT_BONUS      = 6   # 交叉验证加成（仅在 Tier-1 同向冰山已触发时计入）
 # 散户 FOMO 警报（价格窄幅震荡 + 散户加速流入）
 RETAIL_FOMO_WINDOW          = 8             # 回看窗口
 RETAIL_FOMO_PRICE_RANGE_PCT = 0.5           # 价格区间 < 此 % 视为窄幅震荡
@@ -280,6 +302,24 @@ def init_db(db_path: str) -> sqlite3.Connection:
             imbalance     REAL    -- (bid-ask)/(bid+ask)，正值偏多
         );
 
+        CREATE TABLE IF NOT EXISTS tick_flow (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            TEXT,
+            sell_vol      REAL,   -- 窗口内主动卖出量（打在买盘，股）
+            buy_vol       REAL,   -- 窗口内主动买入量（打在卖盘，股）
+            price_first   REAL,   -- 窗口首笔成交价
+            price_last    REAL,   -- 窗口末笔成交价
+            best_bid_vol  REAL,   -- 抓取时买一显示量（股）
+            best_ask_vol  REAL    -- 抓取时卖一显示量（股）
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_queue (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,
+            bid1_id   TEXT,   -- 买一档队首经纪席位 ID（机构吸筹足迹探针）
+            ask1_id   TEXT    -- 卖一档队首经纪席位 ID（机构派发足迹探针）
+        );
+
         CREATE TABLE IF NOT EXISTS signals (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             ts            TEXT,
@@ -336,6 +376,59 @@ def db_save_orderbook(conn: sqlite3.Connection, ts: str,
         (ts, bid, ask, imb),
     )
     conn.commit()
+
+
+def db_save_tick(conn: sqlite3.Connection, ts: str,
+                 sell_vol: float, buy_vol: float,
+                 price_first: float, price_last: float,
+                 best_bid_vol: float, best_ask_vol: float):
+    conn.execute(
+        "INSERT INTO tick_flow VALUES (NULL,?,?,?,?,?,?,?)",
+        (ts, sell_vol, buy_vol, price_first, price_last, best_bid_vol, best_ask_vol),
+    )
+    conn.commit()
+
+
+def db_get_recent_ticks(
+    conn: sqlite3.Connection, n: int, since_ts: Optional[str] = None,
+) -> list[tuple]:
+    """返回最近 n 条 tick_flow 聚合行（最新在前），默认仅限当日交易时段。
+
+    每行为 (sell_vol, buy_vol, price_first, price_last, best_bid_vol, best_ask_vol)。
+    与其它日内窗口同理：跨日窗口会把昨日尾盘成交污染冰山判定，故默认 today() 过滤。
+    """
+    if since_ts is None:
+        since_ts = datetime.date.today().isoformat()
+    rows = conn.execute(
+        "SELECT sell_vol, buy_vol, price_first, price_last, best_bid_vol, best_ask_vol "
+        "FROM tick_flow WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+        (since_ts, n),
+    ).fetchall()
+    return rows
+
+
+def db_save_broker(conn: sqlite3.Connection, ts: str,
+                   bid1_id: Optional[str], ask1_id: Optional[str]):
+    conn.execute(
+        "INSERT INTO broker_queue VALUES (NULL,?,?,?)", (ts, bid1_id, ask1_id),
+    )
+    conn.commit()
+
+
+def db_get_recent_brokers(
+    conn: sqlite3.Connection, n: int, since_ts: Optional[str] = None,
+) -> list[tuple]:
+    """返回最近 n 条 (bid1_id, ask1_id) 队首席位，最新在前，默认仅限当日。
+
+    与冰山同理：经纪足迹是日内概念，跨日窗口会把昨日席位污染判定，故 today() 过滤。
+    """
+    if since_ts is None:
+        since_ts = datetime.date.today().isoformat()
+    rows = conn.execute(
+        "SELECT bid1_id, ask1_id FROM broker_queue WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+        (since_ts, n),
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
 
 
 def db_save_signal(conn: sqlite3.Connection, sig_type: str,
@@ -1291,6 +1384,129 @@ def analyze_sell_no_drop(
 
 
 # ═══════════════════════════════════════════════════════════
+# 五-D3、L2 逐笔冰山检测（执行级被动吸筹 / 真出货裁决）
+# ═══════════════════════════════════════════════════════════
+def analyze_iceberg_absorption(
+    conn: sqlite3.Connection,
+) -> tuple[int, int, list[str]]:
+    """
+    用逐笔成交（execution）而非挂单报价（quote）分辨被动吸筹 vs 真出货——报价层可幌单，
+    成交是真金白银吃出来的，难造假（[[capital-flow-tiers-intent]] aggressor 一节）。
+
+    - **买侧冰山吸筹**：主动卖主导（砸买盘）但价格不跌，且买一被吃量 ≫ 显示量（补单）
+      → 有大资金挂被动买单接货 → 抬升逼空风险、抑制顺势追空。
+    - **卖侧冰山派发**：主动买主导（吃卖盘）但价格滞涨，且卖一被吃量 ≫ 显示量（补单）
+      → 主力挂被动卖单出货 → 支撑做空。
+
+    返回 (squeeze_pts, support_pts, signals)：二者按价格方向互斥，单次最多一个非零。
+    """
+    rows = db_get_recent_ticks(conn, ICEBERG_WINDOW)
+    if len(rows) < ICEBERG_WINDOW:
+        return 0, 0, []
+
+    # rows[0] 最新、rows[-1] 最旧
+    sell_tot = sum(r[0] for r in rows)
+    buy_tot  = sum(r[1] for r in rows)
+    price_first = rows[-1][2]
+    price_last  = rows[0][3]
+    if price_first <= 0:
+        return 0, 0, []
+    price_pct = (price_last - price_first) / price_first * 100
+    best_bid_vol = rows[0][4]
+    best_ask_vol = rows[0][5]
+
+    # 买侧冰山吸筹：主动卖主导 + 价格未跟跌 + 买一被吃量远超显示量
+    if (sell_tot >= ICEBERG_MIN_VOL and sell_tot >= buy_tot * ICEBERG_DOMINANCE
+            and price_pct >= ICEBERG_PRICE_FLOOR):
+        refill = sell_tot / best_bid_vol if best_bid_vol > 0 else float("inf")
+        if refill >= ICEBERG_REFILL_MULT:
+            pts, tag = ICEBERG_STRONG_SCORE, f"买一补单 {refill:.1f}×"
+        else:
+            pts, tag = ICEBERG_WEAK_SCORE, "无明显补单"
+        msg = (f"⚠ L2买侧冰山吸筹：主动卖 {sell_tot:,.0f} 股(>买 {buy_tot:,.0f}) "
+               f"但价 {price_pct:+.2f}%（{tag}）→ 被动吸筹，逼空风险 +{pts} 分")
+        db_save_signal(conn, "ICEBERG_ACCUMULATION", msg, pts)
+        log.warning(f"[L2冰山吸筹] {msg}")
+        return pts, 0, [msg]
+
+    # 卖侧冰山派发：主动买主导 + 价格滞涨 + 卖一被吃量远超显示量
+    if (buy_tot >= ICEBERG_MIN_VOL and buy_tot >= sell_tot * ICEBERG_DOMINANCE
+            and price_pct <= ICEBERG_PRICE_CAP):
+        refill = buy_tot / best_ask_vol if best_ask_vol > 0 else float("inf")
+        if refill >= ICEBERG_REFILL_MULT:
+            pts, tag = ICEBERG_STRONG_SCORE, f"卖一补单 {refill:.1f}×"
+        else:
+            pts, tag = ICEBERG_WEAK_SCORE, "无明显补单"
+        msg = (f"⚠ L2卖侧冰山派发：主动买 {buy_tot:,.0f} 股(>卖 {sell_tot:,.0f}) "
+               f"但价 {price_pct:+.2f}%（{tag}）→ 被动派发 [支撑做空+{pts}分]")
+        db_save_signal(conn, "ICEBERG_DISTRIBUTION", msg, pts)
+        log.warning(f"[L2冰山派发] {msg}")
+        return 0, pts, [msg]
+
+    return 0, 0, []
+
+
+# ═══════════════════════════════════════════════════════════
+# 五-D4、L2 经纪队列足迹（Tier 2，单一席位反复占据最优档 = 机构被动足迹）
+# ═══════════════════════════════════════════════════════════
+def analyze_broker_footprint(
+    conn: sqlite3.Connection, ice_squeeze_pts: int, ice_support_pts: int,
+) -> tuple[int, int, list[str]]:
+    """
+    Tier 2 经纪队列足迹：同一经纪席位反复占据最优档 = 机构被动挂单的足迹。
+
+    **报价层可幌单，故经纪足迹绝不单独加分**——仅当 Tier-1 冰山（执行级成交证据）
+    同向已触发时，作为交叉验证加成抬升置信度（[[capital-flow-tiers-intent]] L2 一节）。
+    若本轮无冰山，直接返回 (0,0,[])，避免假接货墙凭报价骗出诱多/诱空分。
+
+    - 买一侧单一席位持续占据 + Tier-1 买侧冰山吸筹 → 加成逼空风险（抑制追空）。
+    - 卖一侧单一席位持续占据 + Tier-1 卖侧冰山派发 → 加成支撑做空。
+
+    返回 (squeeze_bonus, support_bonus, signals)；非冰山轮恒为 (0,0,[])。
+    """
+    if ice_squeeze_pts <= 0 and ice_support_pts <= 0:
+        return 0, 0, []   # 无执行级冰山证据 → 经纪足迹不单独计分（反幌单铁律）
+
+    rows = db_get_recent_brokers(conn, BROKER_FOOTPRINT_WINDOW)
+    if len(rows) < BROKER_FOOTPRINT_WINDOW:
+        return 0, 0, []
+
+    def _dominant(ids: list) -> tuple[Optional[str], int]:
+        # 过滤无效席位（None/空/0=隐藏或未披露），返回出现最多的 id 及其次数
+        ids = [i for i in ids if i not in (None, "", "0")]
+        best, best_cnt = None, 0
+        for i in set(ids):
+            c = ids.count(i)
+            if c > best_cnt:
+                best, best_cnt = i, c
+        return best, best_cnt
+
+    # 买侧吸筹加成：仅当 Tier-1 买侧冰山已触发
+    if ice_squeeze_pts > 0:
+        bid_id, cnt = _dominant([r[0] for r in rows])
+        if bid_id is not None and cnt >= BROKER_FOOTPRINT_MIN_ROUNDS:
+            pts = BROKER_FOOTPRINT_BONUS
+            msg = (f"⚠ L2经纪足迹：席位 {bid_id} 近 {BROKER_FOOTPRINT_WINDOW} 轮 {cnt} 次占据买一 "
+                   f"+ 冰山吸筹同向 → 机构被动吸筹足迹，逼空风险 +{pts} 分")
+            db_save_signal(conn, "BROKER_FOOTPRINT_BID", msg, pts)
+            log.warning(f"[L2经纪足迹·买] {msg}")
+            return pts, 0, [msg]
+
+    # 卖侧派发加成：仅当 Tier-1 卖侧冰山已触发
+    if ice_support_pts > 0:
+        ask_id, cnt = _dominant([r[1] for r in rows])
+        if ask_id is not None and cnt >= BROKER_FOOTPRINT_MIN_ROUNDS:
+            pts = BROKER_FOOTPRINT_BONUS
+            msg = (f"⚠ L2经纪足迹：席位 {ask_id} 近 {BROKER_FOOTPRINT_WINDOW} 轮 {cnt} 次占据卖一 "
+                   f"+ 冰山派发同向 → 机构被动派发足迹 [支撑做空+{pts}分]")
+            db_save_signal(conn, "BROKER_FOOTPRINT_ASK", msg, pts)
+            log.warning(f"[L2经纪足迹·卖] {msg}")
+            return 0, pts, [msg]
+
+    return 0, 0, []
+
+
+# ═══════════════════════════════════════════════════════════
 # 五-E、散户 FOMO 警报（窄幅震荡中散户加速流入）
 # ═══════════════════════════════════════════════════════════
 def analyze_retail_fomo(
@@ -1406,11 +1622,101 @@ def fetch_order_book(ctx: OpenQuoteContext, conn: sqlite3.Connection
     total = bid_depth + ask_depth
     imbalance = (bid_depth - ask_depth) / total if total > 0 else 0.0
 
+    # 最优档显示量（供 L2 冰山检测对比"被吃量 vs 显示量"判补单）
+    best_bid_vol = float(bid_list[0][1]) if bid_list else 0.0
+    best_ask_vol = float(ask_list[0][1]) if ask_list else 0.0
+
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     db_save_orderbook(conn, ts, bid_depth, ask_depth, imbalance)
 
     return {"ts": ts, "bid_depth": bid_depth,
-            "ask_depth": ask_depth, "imbalance": imbalance}
+            "ask_depth": ask_depth, "imbalance": imbalance,
+            "best_bid_vol": best_bid_vol, "best_ask_vol": best_ask_vol}
+
+
+def fetch_ticks(ctx: OpenQuoteContext, conn: sqlite3.Connection,
+                ob: Optional[dict]) -> Optional[dict]:
+    """
+    拉取逐笔成交（需 SubType.TICKER 订阅），按 sequence 去重只统计上次轮询后的新成交，
+    聚合本窗口主动买/卖量并结合最优档显示量存入 tick_flow，供 analyze_iceberg_absorption
+    做执行级冰山判定。
+
+    Aggressor 语义（Futu ticker_direction）：BUY=主动买（打卖盘）、SELL=主动卖（打买盘）。
+    逐笔是增强信号，失败仅返回 None、不阻断核心打分。Futu 单次上限 1000 笔，
+    极活跃标的两次轮询间成交 > 1000 会少计（不影响方向判定，只是低估量级）。
+    """
+    try:
+        ret, data = ctx.get_rt_ticker(SYMBOL, num=ICEBERG_TICK_FETCH_NUM)
+    except Exception as e:                      # 未订阅/网络异常等，静默跳过
+        log.debug(f"get_rt_ticker 异常: {e}")
+        return None
+    if ret != RET_OK or data is None or getattr(data, "empty", True):
+        return None
+    if "sequence" not in data.columns or "ticker_direction" not in data.columns:
+        return None
+
+    data = data.sort_values("sequence")
+    last_seq = getattr(fetch_ticks, "_last_seq", None)
+    if last_seq is not None:
+        data = data[data["sequence"] > last_seq]
+    if data.empty:
+        return None
+    fetch_ticks._last_seq = int(data["sequence"].max())
+
+    dir_col = data["ticker_direction"].astype(str).str.upper()
+    vol = data["volume"].astype(float)
+    sell_vol = float(vol[dir_col.str.contains("SELL")].sum())
+    buy_vol  = float(vol[dir_col.str.contains("BUY")].sum())
+
+    prices = [float(p) for p in data["price"].tolist()
+              if p is not None and float(p) > 0]
+    if not prices:
+        return None
+    price_first, price_last = prices[0], prices[-1]
+    best_bid_vol = float(ob.get("best_bid_vol", 0.0)) if ob else 0.0
+    best_ask_vol = float(ob.get("best_ask_vol", 0.0)) if ob else 0.0
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    db_save_tick(conn, ts, sell_vol, buy_vol,
+                 price_first, price_last, best_bid_vol, best_ask_vol)
+    return {"ts": ts, "sell_vol": sell_vol, "buy_vol": buy_vol,
+            "best_bid_vol": best_bid_vol, "best_ask_vol": best_ask_vol}
+
+
+def fetch_broker_queue(ctx: OpenQuoteContext, conn: sqlite3.Connection
+                       ) -> Optional[dict]:
+    """
+    拉取经纪队列（需 SubType.BROKER 订阅），记录买一/卖一档队首席位 ID，供
+    analyze_broker_footprint 检测单一机构席位是否反复占据最优档（被动吸筹/派发足迹）。
+
+    Futu get_broker_queue 返回 (ret, bid_frame, ask_frame)；取每侧队首行的 broker_id。
+    报价层增强信号，失败仅返回 None、不阻断核心打分（不进 API 失效守门）。
+    """
+    try:
+        ret, bid_frame, ask_frame = ctx.get_broker_queue(SYMBOL)
+    except Exception as e:                      # 未订阅/网络异常/返回元数不符等
+        log.debug(f"get_broker_queue 异常: {e}")
+        return None
+    if ret != RET_OK:
+        return None
+
+    def _front_id(frame, col: str) -> Optional[str]:
+        try:
+            if frame is None or getattr(frame, "empty", True) or col not in frame.columns:
+                return None
+            val = frame.iloc[0][col]
+            return None if val is None else str(val)
+        except Exception:
+            return None
+
+    bid1_id = _front_id(bid_frame, "bid_broker_id")
+    ask1_id = _front_id(ask_frame, "ask_broker_id")
+    if bid1_id is None and ask1_id is None:
+        return None
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    db_save_broker(conn, ts, bid1_id, ask1_id)
+    return {"ts": ts, "bid1_id": bid1_id, "ask1_id": ask1_id}
 
 
 def analyze_order_book(conn: sqlite3.Connection,
@@ -2687,9 +2993,19 @@ def run_monitor(held_short: Optional[HeldShort] = None):
         state.in_position = True     # 自动标记持仓
     ctx   = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
 
-    ret, err = ctx.subscribe([SYMBOL], [SubType.QUOTE, SubType.ORDER_BOOK])
+    # 核心订阅（QUOTE/ORDER_BOOK/TICKER）——TICKER 逐笔在 LV1 即可用，是 Tier-1 冰山数据源。
+    ret, err = ctx.subscribe(
+        [SYMBOL], [SubType.QUOTE, SubType.ORDER_BOOK, SubType.TICKER]
+    )
     if ret != RET_OK:
-        log.warning(f"订阅失败: {err}（将使用快照模式）")
+        log.warning(f"核心订阅失败: {err}（将使用快照模式；逐笔冰山检测可能不可用）")
+
+    # 经纪队列（Tier-2 足迹）必须单独订阅：LV1 权限不支持，且若并入上面那批会触发
+    # 整批原子失败（连 TICKER 都订不上，拖垮 Tier-1）。失败则降级为纯 Tier-1。
+    ret_brk, err_brk = ctx.subscribe([SYMBOL], [SubType.BROKER])
+    broker_available = (ret_brk == RET_OK)
+    if not broker_available:
+        log.info(f"经纪队列订阅不可用（{err_brk}）；Tier-2 足迹关闭，仅用 Tier-1 逐笔冰山")
 
     try:
         while True:
@@ -2748,6 +3064,12 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 state._orderbook_fail_count = 0
             else:
                 state._orderbook_fail_count += 1
+
+            # ── L2 逐笔成交（Tier 1 冰山检测数据源；增强信号，失败不阻断）──
+            fetch_ticks(ctx, conn, ob)
+            # ── L2 经纪队列（Tier 2 足迹；仅在 BROKER 订阅可用时拉取，LV1 自动跳过）──
+            if broker_available:
+                fetch_broker_queue(ctx, conn)
 
             # ── 数据新鲜度守门：核心 API 连续失败 → 跳过打分 ──────
             # Futu API 失败时 state 旧值会被保留，若不守门则评分基于陈旧快照
@@ -2836,6 +3158,11 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             s_eff, sg_eff = analyze_capital_efficiency(conn, state.last_price)
             # 卖而不跌（大单+中单净流出但价格守位/反弹）→ 被动吸筹/诱空，抬升逼空风险
             s_snd, sg_snd = analyze_sell_no_drop(conn, state.last_price)
+            # L2 逐笔冰山（执行级）：吸筹 → 抬升逼空(s_ice_sq)，派发 → 支撑做空(s_ice_sup)
+            s_ice_sq, s_ice_sup, sg_ice = analyze_iceberg_absorption(conn)
+            # L2 经纪足迹（Tier 2）：单一席位反复占据最优档，仅在同向冰山已触发时加成
+            s_brk_sq, s_brk_sup, sg_brk = analyze_broker_footprint(
+                conn, s_ice_sq, s_ice_sup)
             # 散户 FOMO（窄幅震荡中加速流入）→ 支撑做空
             s_fomo, sg_fomo = analyze_retail_fomo(conn, state.last_price)
             # 中单拆单（大单冻结期间 mid_net 节奏稳定）→ 支撑做空
@@ -2843,7 +3170,8 @@ def run_monitor(held_short: Optional[HeldShort] = None):
 
             squeeze_damper = (-s_struct if s_struct < 0 else 0) + (-s_eff if s_eff < 0 else 0)
             squeeze_score = max(
-                min(s1 + s2 + s3 + hkex_squeeze_risk + s_rev + s_snd - squeeze_damper, 100),
+                min(s1 + s2 + s3 + hkex_squeeze_risk + s_rev + s_snd + s_ice_sq
+                    + s_brk_sq - squeeze_damper, 100),
                 0,
             )
             # sg1 中可能包含「支撑做空」语义（价格下行时的反转计分），分流展示
@@ -2854,7 +3182,8 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             sg_struct_squeeze = [s for s in sg_struct if "支撑做空" not in s]
             # 资金效率信号属于"折扣"语义，归入逼空面板
             squeeze_signals = (sg1_squeeze + sg2 + sg3 + sg_rev + sg_struct_squeeze
-                               + sg_eff + sg_snd
+                               + sg_eff + sg_snd + (sg_ice if s_ice_sq else [])
+                               + (sg_brk if s_brk_sq else [])
                                + [s for s in hkex_sigs if "逼空" in s or "亏损" in s])
 
             # ── 维护近 N 轮逼空评分历史（供做空安全门取峰值）─────
@@ -2889,14 +3218,16 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             main_signal_score = short_score   # analyze_short_entry 返回的就是主信号分
             struct_support = s_struct if s_struct > 0 else 0
             support_score = (hkex_support + s1_support + pump_support + struct_support
-                             + s_retreat + s_fomo + s_split)
+                             + s_retreat + s_fomo + s_split + s_ice_sup + s_brk_sup)
             short_score = min(main_signal_score + support_score, 100)
             short_sigs  = (short_sigs
                            + [s for s in hkex_sigs if "支撑做空" in s]
                            + sg1_support
                            + pump_sigs
                            + sg_struct_support
-                           + sg_retreat + sg_fomo + sg_split)
+                           + sg_retreat + sg_fomo + sg_split
+                           + (sg_ice if s_ice_sup else [])
+                           + (sg_brk if s_brk_sup else []))
             # 仅在 HOLD 时根据 HKEX 叠加分升级；BLOCKED/CAUTION 由 analyze_short_entry
             # 内的安全门和 failsafe 决定，不允许在此被覆盖回 ENTRY，避免诱空陷阱。
             if short_signal == "HOLD":
