@@ -305,23 +305,39 @@ def log_trade(conn: sqlite3.Connection, action: str, price: float,
 
 # ── 以下 DB 读取函数与 short_squeeze_monitor.py 完全相同 ──
 
-def db_get_recent_big_net(conn: sqlite3.Connection, n: int) -> list[float]:
+def db_get_recent_big_net(conn: sqlite3.Connection, n: int,
+                          since_ts: Optional[str] = None) -> list[float]:
+    # 默认仅限当日：big_net 是日内累计值、每日清零，跨日窗口会污染动能/连续性判断
+    if since_ts is None:
+        since_ts = datetime.date.today().isoformat()
     rows = conn.execute(
-        "SELECT big_net FROM capital_flow ORDER BY id DESC LIMIT ?", (n,)
+        "SELECT big_net FROM capital_flow WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+        (since_ts, n),
     ).fetchall()
     return [r[0] for r in rows]
 
 
-def db_get_recent_ask_depth(conn: sqlite3.Connection, n: int) -> list[float]:
+def db_get_recent_ask_depth(conn: sqlite3.Connection, n: int,
+                            since_ts: Optional[str] = None) -> list[float]:
+    # 默认仅限当日：跨日窗口会把上一交易日盘口深度混入基准，触发假"深度骤减"信号
+    # （实盘 2026-06-03 06082 案例，详见 short_squeeze_monitor.db_get_recent_ask_depth）
+    if since_ts is None:
+        since_ts = datetime.date.today().isoformat()
     rows = conn.execute(
-        "SELECT ask_depth FROM orderbook_snapshots ORDER BY id DESC LIMIT ?", (n,)
+        "SELECT ask_depth FROM orderbook_snapshots WHERE ts >= ? "
+        "ORDER BY id DESC LIMIT ?", (since_ts, n),
     ).fetchall()
     return [r[0] for r in rows]
 
 
-def db_get_recent_prices(conn: sqlite3.Connection, n: int) -> list[float]:
+def db_get_recent_prices(conn: sqlite3.Connection, n: int,
+                         since_ts: Optional[str] = None) -> list[float]:
+    # 默认仅限当日：反弹/动能窗口是日内概念，跨日会把昨日收盘价当作"近期高/低点"
+    if since_ts is None:
+        since_ts = datetime.date.today().isoformat()
     rows = conn.execute(
-        "SELECT price FROM price_history ORDER BY id DESC LIMIT ?", (n,)
+        "SELECT price FROM price_history WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+        (since_ts, n),
     ).fetchall()
     return [r[0] for r in reversed(rows)]
 

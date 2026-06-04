@@ -27,7 +27,7 @@ Futu OpenD   ──API────►        (runs continuously)               �
 
 1. **Monitor (`short_squeeze_monitor.py`)**: Real-time engine tracking four signal categories. Supports `--stock <code>` for multi-stock operation. Writes current squeeze/short scores to `monitor_state` DB table every cycle.
    - **HKEX Short Ratio**: Daily congestion indicator (scrapes `<pre>`-formatted file via `#short_selling` anchor, not HTML tables).
-   - **Capital Flow**: Large order net inflow/outflow via Futu `get_capital_distribution()` (returns cumulative daily HKD, not 万HKD).
+   - **Capital Flow**: Large order net inflow/outflow via Futu `get_capital_distribution()` (returns cumulative daily HKD, not 万HKD). ⚠ **Note**: Classified by *Aggressor* (Active side). Hits at Ask count as Inflow; hits at Bid count as Outflow. Passive selling by institutions at the Ask appears as "Inflow".
    - **Order Book Depth**: Ask/Bid imbalance and depth shrinkage via `get_order_book()`.
    - **Historical Momentum**: Weighted short cost-basis vs. current price from `hkex_daily` history.
 2. **Paper Trader (`paper_trader.py`)**: Automated simulated-trading bot. Reads `monitor_state` every 15s, executes paper orders when scoring conditions are met. Thresholds hot-reload from `config/trader_config.json` every 60s.
