@@ -182,13 +182,35 @@ ICEBERG_REFILL_MULT     = 2.0        # 被动方成交量 ≥ 最优档显示量
 ICEBERG_STRONG_SCORE    = 15         # 冰山补单确认（强：显示量被反复吃穿仍补回）
 ICEBERG_WEAK_SCORE      = 8          # 仅"成交被吸收价不动"（弱：无补单铁证）
 ICEBERG_TICK_FETCH_NUM  = 1000       # get_rt_ticker 单次拉取上限（Futu 上限，去重靠 sequence）
-# L2 经纪队列足迹（Tier 2，2026-06-04）——单一经纪席位反复占据最优档=机构被动挂单足迹。
-# 报价层可幌单（00981 06-04 卖深 500↔135,500 来回甩），故经纪足迹**绝不单独加分**：
-# 仅当 Tier-1 冰山（执行级成交证据）同向已触发时，作为交叉验证加成抬升置信度。
-# 买一侧单一席位持续占据 → 确认吸筹；卖一侧 → 确认派发。需订阅 SubType.BROKER。
+# L2 经纪队列足迹（Tier 2，2026-06-04；迭代三十二改判断依据）——同一机构持续单边压最优档
+# = 机构被动挂单足迹。报价层可幌单，故经纪足迹**绝不单独加分**：仅当 Tier-1 冰山（执行级
+# 成交证据）同向已触发时作交叉验证加成。
+#
+# 判断依据 v2（v1 对大票失效，实盘 00981 06-04 验证后重写）：
+#   ① 按 broker_name 聚合，非 broker_id——同一机构常占多个 ID（荷银占 17 买档/22 卖档，
+#      按 ID 会被拆散看不出集中度）。
+#   ② 只看最优档（broker_pos==1）的席位数。
+#   ③ 用买卖两侧净不对称过滤做市商——荷银/巴克莱两侧都重仓（做市报价，非方向性）；
+#      净不对称 = 该机构本侧席位数 − 其对侧席位数，>0 才是单边方向性足迹。
 BROKER_FOOTPRINT_WINDOW     = 6   # 回看 broker_queue 行数（每行≈一个轮询）
-BROKER_FOOTPRINT_MIN_ROUNDS = 4   # 同一 broker_id 占据最优档 ≥ 此轮数（窗口内）视为持续足迹
+BROKER_FOOTPRINT_MIN_ROUNDS = 3   # 同一机构单边领先最优档 ≥ 此轮数（窗口内）视为持续足迹（放宽：4→3 观察）
+BROKER_FOOTPRINT_MIN_NET    = 2   # 净不对称（本侧 − 对侧席位数）均值 ≥ 此值才算单边压盘（滤做市商/噪音）
 BROKER_FOOTPRINT_BONUS      = 6   # 交叉验证加成（仅在 Tier-1 同向冰山已触发时计入）
+
+# ─────────────────────────────────────────────────────────
+# 主力嫌疑分（控盘特征筛查）—— 纯背景画像，不参与做空/逼空打分
+# 用途：挑出像 00100 MINIMAX（价格钉扎 601.00 + 摩根士丹利长期独占卖一 + 薄盘）这类
+# 单一席位控盘的标的，避开像 00981 中芯（盘深、席位轮换、价格连续）的纯市场化大盘。
+# 三个子维度加权（满分 100，仅展示）：① 价格钉扎 50 ② 席位集中 35 ③ 盘薄 15。
+# 注意：盘薄阈值按"股数"判定，与股价量级相关，换低价/高价股需重标定 MF_THIN_*。
+MF_WINDOW              = 12      # 三维统一回看窗口（轮）
+MF_MIN_ROUNDS          = 6       # 样本不足此数则不评估（返回 0）
+MF_PIN_BAND_PCT        = 0.6     # 窗口内 (max-min)/median ≤ 此 % → 视为价格被夹在窄带（满分线 0%）
+MF_PIN_MODE_RATIO      = 0.5     # 单一价格出现轮数占比 ≥ 此值 → 钉扎（精确同价，主力按价铁证）
+MF_SEAT_MIN_NET        = 3       # 席位净不对称 ≥ 此值才计入"该轮有主导席位"（滤 1 席噪音）
+MF_SEAT_DOM_RATIO      = 0.5     # 同一席位占据主导轮数占比 ≥ 此值 → 集中（满分线 0.8）
+MF_THIN_DEPTH_SHARES   = 30_000  # 卖盘深度中位 ≤ 此股数 → 薄盘易控；≤ 半值给满分
+# ─────────────────────────────────────────────────────────
 # 散户 FOMO 警报（价格窄幅震荡 + 散户加速流入）
 RETAIL_FOMO_WINDOW          = 8             # 回看窗口
 RETAIL_FOMO_PRICE_RANGE_PCT = 0.5           # 价格区间 < 此 % 视为窄幅震荡
@@ -275,6 +297,15 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    # broker_queue v1→v2 迁移（迭代三十二）：v1 存 bid1_id/ask1_id（按 ID、仅队首席位），
+    # 实盘证明对大票失效（同名机构多 ID 被拆散、做市商两侧挂单被误判）。v2 改存按 name
+    # 聚合的最优档净不对称。旧表仅当日观测、从未触发，无历史价值，直接 DROP 重建。
+    try:
+        _bq_cols = [r[1] for r in conn.execute("PRAGMA table_info(broker_queue)")]
+        if _bq_cols and "bid1_id" in _bq_cols:
+            conn.execute("DROP TABLE broker_queue")
+    except sqlite3.OperationalError:
+        pass
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS hkex_daily (
             date          TEXT PRIMARY KEY,  -- YYYY-MM-DD
@@ -314,10 +345,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
         );
 
         CREATE TABLE IF NOT EXISTS broker_queue (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts        TEXT,
-            bid1_id   TEXT,   -- 买一档队首经纪席位 ID（机构吸筹足迹探针）
-            ask1_id   TEXT    -- 卖一档队首经纪席位 ID（机构派发足迹探针）
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            TEXT,
+            bid_top_name  TEXT,   -- 买一档净不对称最强的机构名（吸筹足迹候选）
+            bid_top_net   INTEGER,-- 该机构 买一档席位数 − 其卖一档席位数（>0=单边压买盘）
+            ask_top_name  TEXT,   -- 卖一档净不对称最强的机构名（派发足迹候选）
+            ask_top_net   INTEGER -- 该机构 卖一档席位数 − 其买一档席位数（>0=单边压卖盘）
         );
 
         CREATE TABLE IF NOT EXISTS signals (
@@ -408,9 +441,11 @@ def db_get_recent_ticks(
 
 
 def db_save_broker(conn: sqlite3.Connection, ts: str,
-                   bid1_id: Optional[str], ask1_id: Optional[str]):
+                   bid_top_name: Optional[str], bid_top_net: int,
+                   ask_top_name: Optional[str], ask_top_net: int):
     conn.execute(
-        "INSERT INTO broker_queue VALUES (NULL,?,?,?)", (ts, bid1_id, ask1_id),
+        "INSERT INTO broker_queue VALUES (NULL,?,?,?,?,?)",
+        (ts, bid_top_name, bid_top_net, ask_top_name, ask_top_net),
     )
     conn.commit()
 
@@ -418,17 +453,18 @@ def db_save_broker(conn: sqlite3.Connection, ts: str,
 def db_get_recent_brokers(
     conn: sqlite3.Connection, n: int, since_ts: Optional[str] = None,
 ) -> list[tuple]:
-    """返回最近 n 条 (bid1_id, ask1_id) 队首席位，最新在前，默认仅限当日。
+    """返回最近 n 条 (bid_top_name, bid_top_net, ask_top_name, ask_top_net)，最新在前，默认仅限当日。
 
     与冰山同理：经纪足迹是日内概念，跨日窗口会把昨日席位污染判定，故 today() 过滤。
     """
     if since_ts is None:
         since_ts = datetime.date.today().isoformat()
     rows = conn.execute(
-        "SELECT bid1_id, ask1_id FROM broker_queue WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+        "SELECT bid_top_name, bid_top_net, ask_top_name, ask_top_net "
+        "FROM broker_queue WHERE ts >= ? ORDER BY id DESC LIMIT ?",
         (since_ts, n),
     ).fetchall()
-    return [(r[0], r[1]) for r in rows]
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
 def db_save_signal(conn: sqlite3.Connection, sig_type: str,
@@ -1453,14 +1489,16 @@ def analyze_broker_footprint(
     conn: sqlite3.Connection, ice_squeeze_pts: int, ice_support_pts: int,
 ) -> tuple[int, int, list[str]]:
     """
-    Tier 2 经纪队列足迹：同一经纪席位反复占据最优档 = 机构被动挂单的足迹。
+    Tier 2 经纪队列足迹：同一机构持续单边压最优档 = 机构被动挂单的足迹。
 
     **报价层可幌单，故经纪足迹绝不单独加分**——仅当 Tier-1 冰山（执行级成交证据）
     同向已触发时，作为交叉验证加成抬升置信度（[[capital-flow-tiers-intent]] L2 一节）。
     若本轮无冰山，直接返回 (0,0,[])，避免假接货墙凭报价骗出诱多/诱空分。
 
-    - 买一侧单一席位持续占据 + Tier-1 买侧冰山吸筹 → 加成逼空风险（抑制追空）。
-    - 卖一侧单一席位持续占据 + Tier-1 卖侧冰山派发 → 加成支撑做空。
+    判断依据 v2（按机构名 + 最优档 + 净不对称，见 BROKER_FOOTPRINT_* 常量注释）：
+      - 买侧：同一机构在窗口内 ≥MIN_ROUNDS 轮是买侧净不对称最强者，且其净值均值 ≥MIN_NET
+        + Tier-1 买侧冰山吸筹 → 加成逼空风险（抑制追空）。
+      - 卖侧：对称——同机构持续单边压卖盘 + Tier-1 卖侧冰山派发 → 加成支撑做空。
 
     返回 (squeeze_bonus, support_bonus, signals)；非冰山轮恒为 (0,0,[])。
     """
@@ -1471,39 +1509,146 @@ def analyze_broker_footprint(
     if len(rows) < BROKER_FOOTPRINT_WINDOW:
         return 0, 0, []
 
-    def _dominant(ids: list) -> tuple[Optional[str], int]:
-        # 过滤无效席位（None/空/0=隐藏或未披露），返回出现最多的 id 及其次数
-        ids = [i for i in ids if i not in (None, "", "0")]
+    def _persistent(name_net_pairs: list) -> tuple[Optional[str], int, float]:
+        """找窗口内「领先轮数最多」的机构，返回 (name, 领先轮数, 这些轮净值均值)。
+        仅统计净不对称 ≥ MIN_NET 的轮次——做市商/噪音轮（净≈0）不计入领先。"""
+        rounds: dict = {}
+        nets: dict = {}
+        for nm, net in name_net_pairs:
+            if nm is None or net is None or net < BROKER_FOOTPRINT_MIN_NET:
+                continue
+            rounds[nm] = rounds.get(nm, 0) + 1
+            nets.setdefault(nm, []).append(net)
         best, best_cnt = None, 0
-        for i in set(ids):
-            c = ids.count(i)
+        for nm, c in rounds.items():
             if c > best_cnt:
-                best, best_cnt = i, c
-        return best, best_cnt
+                best, best_cnt = nm, c
+        avg = sum(nets[best]) / len(nets[best]) if best else 0.0
+        return best, best_cnt, avg
 
     # 买侧吸筹加成：仅当 Tier-1 买侧冰山已触发
     if ice_squeeze_pts > 0:
-        bid_id, cnt = _dominant([r[0] for r in rows])
-        if bid_id is not None and cnt >= BROKER_FOOTPRINT_MIN_ROUNDS:
+        name, cnt, avg = _persistent([(r[0], r[1]) for r in rows])
+        if name is not None and cnt >= BROKER_FOOTPRINT_MIN_ROUNDS:
             pts = BROKER_FOOTPRINT_BONUS
-            msg = (f"⚠ L2经纪足迹：席位 {bid_id} 近 {BROKER_FOOTPRINT_WINDOW} 轮 {cnt} 次占据买一 "
-                   f"+ 冰山吸筹同向 → 机构被动吸筹足迹，逼空风险 +{pts} 分")
+            msg = (f"⚠ L2经纪足迹：{name} 近 {BROKER_FOOTPRINT_WINDOW} 轮 {cnt} 轮单边压买盘"
+                   f"（净均 +{avg:.1f} 席）+ 冰山吸筹同向 → 机构被动吸筹足迹，逼空风险 +{pts} 分")
             db_save_signal(conn, "BROKER_FOOTPRINT_BID", msg, pts)
             log.warning(f"[L2经纪足迹·买] {msg}")
             return pts, 0, [msg]
 
     # 卖侧派发加成：仅当 Tier-1 卖侧冰山已触发
     if ice_support_pts > 0:
-        ask_id, cnt = _dominant([r[1] for r in rows])
-        if ask_id is not None and cnt >= BROKER_FOOTPRINT_MIN_ROUNDS:
+        name, cnt, avg = _persistent([(r[2], r[3]) for r in rows])
+        if name is not None and cnt >= BROKER_FOOTPRINT_MIN_ROUNDS:
             pts = BROKER_FOOTPRINT_BONUS
-            msg = (f"⚠ L2经纪足迹：席位 {ask_id} 近 {BROKER_FOOTPRINT_WINDOW} 轮 {cnt} 次占据卖一 "
-                   f"+ 冰山派发同向 → 机构被动派发足迹 [支撑做空+{pts}分]")
+            msg = (f"⚠ L2经纪足迹：{name} 近 {BROKER_FOOTPRINT_WINDOW} 轮 {cnt} 轮单边压卖盘"
+                   f"（净均 +{avg:.1f} 席）+ 冰山派发同向 → 机构被动派发足迹 [支撑做空+{pts}分]")
             db_save_signal(conn, "BROKER_FOOTPRINT_ASK", msg, pts)
             log.warning(f"[L2经纪足迹·卖] {msg}")
             return 0, pts, [msg]
 
     return 0, 0, []
+
+
+# ═══════════════════════════════════════════════════════════
+# 五-D2、主力嫌疑分（控盘特征筛查，纯背景画像）
+# ═══════════════════════════════════════════════════════════
+def analyze_main_force_control(
+    conn: sqlite3.Connection,
+) -> tuple[int, str, list[str]]:
+    """
+    控盘嫌疑度评分（0-100）——筛出单一主力控盘的标的，不参与交易打分。
+
+    三个子维度（来自仪表盘已有数据，无需新订阅）：
+      ① 价格钉扎 (0-50)：窗口内价格被夹在极窄带，或反复精确停在同一价。
+         散户做不到把价格焊在某点，长时间钉扎 = 控盘方在按价（00100 钉 601.00）。
+      ② 席位集中 (0-35)：同一券商席位持续独占买/卖最优档（复用 broker 聚合）。
+         00100 摩根士丹利长期压卖一 = 强控盘；00981 席位轮换 = 市场化。
+      ③ 盘薄 (0-15)：卖盘深度中位很小 → 小资金即可拨动 → 易控。
+
+    返回 (score, label, signals)。label 给四档定性，signals 列出命中的子维度明细。
+    """
+    prices  = db_get_recent_prices(conn, MF_WINDOW)
+    brokers = db_get_recent_brokers(conn, MF_WINDOW)
+    depths  = db_get_recent_ask_depth(conn, MF_WINDOW)
+    sigs: list[str] = []
+
+    # ── ① 价格钉扎 ────────────────────────────────────────────
+    pin_score = 0
+    if len(prices) >= MF_MIN_ROUNDS:
+        med = statistics.median(prices)
+        if med > 0:
+            band_pct = (max(prices) - min(prices)) / med * 100
+            # 窄带分：band 0% → 50，band ≥ MF_PIN_BAND_PCT → 0，线性
+            band_score = max(0.0, 1 - band_pct / MF_PIN_BAND_PCT) * 50
+            # 精确同价分：最高频价格的占比，≥ MF_PIN_MODE_RATIO 起，满占比 → 50
+            mode_cnt = max(prices.count(p) for p in set(prices))
+            mode_ratio = mode_cnt / len(prices)
+            mode_score = 0.0
+            if mode_ratio >= MF_PIN_MODE_RATIO:
+                mode_score = (mode_ratio - MF_PIN_MODE_RATIO) / (1 - MF_PIN_MODE_RATIO) * 50
+            pin_score = int(round(min(max(band_score, mode_score), 50)))
+            if pin_score >= 12:
+                detail = (f"价格钉扎：近 {len(prices)} 轮带宽 {band_pct:.2f}%"
+                          f"，最高频价 {statistics.mode(prices):.3g} 占 {mode_ratio*100:.0f}% [+{pin_score}]")
+                sigs.append(detail)
+
+    # ── ② 席位集中（同一席位持续独占【同一侧】最优档）──────────────
+    # 关键：按买/卖侧分别统计。控盘席位长期钉在一侧（00100 摩根士丹利常驻卖一）；
+    # 清算行（如荷银）随成交在买卖两侧来回切换，分侧统计后任一侧占比都上不去 → 自动滤除。
+    seat_score = 0
+    if len(brokers) >= MF_MIN_ROUNDS:
+        bid_cnt: dict = {}
+        ask_cnt: dict = {}
+        for bid_nm, bid_net, ask_nm, ask_net in brokers:
+            if bid_nm and (bid_net or 0) >= MF_SEAT_MIN_NET:
+                bid_cnt[bid_nm] = bid_cnt.get(bid_nm, 0) + 1
+            if ask_nm and (ask_net or 0) >= MF_SEAT_MIN_NET:
+                ask_cnt[ask_nm] = ask_cnt.get(ask_nm, 0) + 1
+        best_side, best_name, best_ratio = None, None, 0.0
+        for side, cnt in (("买一", bid_cnt), ("卖一", ask_cnt)):
+            if not cnt:
+                continue
+            nm = max(cnt, key=cnt.get)
+            ratio = cnt[nm] / len(brokers)
+            if ratio > best_ratio:
+                best_side, best_name, best_ratio = side, nm, ratio
+        if best_name and best_ratio >= MF_SEAT_DOM_RATIO:
+            # best_ratio MF_SEAT_DOM_RATIO → 0，0.8 → 满分 35
+            seat_score = int(round(
+                min((best_ratio - MF_SEAT_DOM_RATIO) / (0.8 - MF_SEAT_DOM_RATIO), 1.0) * 35
+            ))
+            if seat_score > 0:
+                sigs.append(
+                    f"席位集中：{best_name[:6]} 近 {len(brokers)} 轮 "
+                    f"{int(best_ratio*len(brokers))} 轮独占{best_side}（{best_ratio*100:.0f}%）[+{seat_score}]"
+                )
+
+    # ── ③ 盘薄 ────────────────────────────────────────────────
+    thin_score = 0
+    if len(depths) >= MF_MIN_ROUNDS:
+        med_depth = statistics.median(depths)
+        if 0 < med_depth <= MF_THIN_DEPTH_SHARES:
+            # med ≤ 半阈值 → 满分 15；半阈值~阈值 → 线性 15→0
+            half = MF_THIN_DEPTH_SHARES / 2
+            if med_depth <= half:
+                thin_score = 15
+            else:
+                thin_score = int(round((MF_THIN_DEPTH_SHARES - med_depth) / half * 15))
+            if thin_score > 0:
+                sigs.append(f"盘薄：卖盘深度中位 {med_depth:,.0f} 股（≤{MF_THIN_DEPTH_SHARES:,}）易控 [+{thin_score}]")
+
+    score = min(pin_score + seat_score + thin_score, 100)
+    if score >= 60:
+        label = "强控盘嫌疑"
+    elif score >= 35:
+        label = "疑似控盘"
+    elif score >= 20:
+        label = "轻微控盘特征"
+    else:
+        label = "无明显控盘(市场化)"
+    return score, label, sigs
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1657,8 +1802,14 @@ def fetch_ticks(ctx: OpenQuoteContext, conn: sqlite3.Connection,
 
     data = data.sort_values("sequence")
     last_seq = getattr(fetch_ticks, "_last_seq", None)
-    if last_seq is not None:
-        data = data[data["sequence"] > last_seq]
+    if last_seq is None:
+        # 首拉（含进程重启）：get_rt_ticker 一次性返回历史积压（至多 1000 笔），若直接
+        # 聚合成一个窗口行，会把"主动买/卖量"灌虚、污染之后 ICEBERG_WINDOW 轮的冰山求和
+        # （实盘 2026-06-04 重启后冰山补单倍数虚高至 55×）。故首拉仅用于建立去重基线
+        # _last_seq，不写 tick_flow、不计入窗口；下一轮起只统计真正的新成交。
+        fetch_ticks._last_seq = int(data["sequence"].max())
+        return None
+    data = data[data["sequence"] > last_seq]
     if data.empty:
         return None
     fetch_ticks._last_seq = int(data["sequence"].max())
@@ -1686,11 +1837,15 @@ def fetch_ticks(ctx: OpenQuoteContext, conn: sqlite3.Connection,
 def fetch_broker_queue(ctx: OpenQuoteContext, conn: sqlite3.Connection
                        ) -> Optional[dict]:
     """
-    拉取经纪队列（需 SubType.BROKER 订阅），记录买一/卖一档队首席位 ID，供
-    analyze_broker_footprint 检测单一机构席位是否反复占据最优档（被动吸筹/派发足迹）。
+    拉取经纪队列（需 SubType.BROKER 订阅），按机构名聚合最优档席位并算买卖净不对称，供
+    analyze_broker_footprint 检测单一机构是否持续单边压盘（被动吸筹/派发足迹）。
 
-    Futu get_broker_queue 返回 (ret, bid_frame, ask_frame)；取每侧队首行的 broker_id。
-    报价层增强信号，失败仅返回 None、不阻断核心打分（不进 API 失效守门）。
+    Futu get_broker_queue 返回 (ret, bid_frame, ask_frame)，列含 *_broker_name/_broker_pos。
+    判断依据 v2（见 BROKER_FOOTPRINT_* 常量注释）：
+      - 按 broker_name 聚合（非 id，同机构常占多 ID）；
+      - 只看最优档 broker_pos==1 的席位数；
+      - 净不对称 = 该机构本侧席位数 − 其对侧席位数（滤掉两侧都挂的做市商）。
+    每侧取净不对称最大的机构及其净值入库。报价层增强信号，失败仅返回 None、不阻断打分。
     """
     try:
         ret, bid_frame, ask_frame = ctx.get_broker_queue(SYMBOL)
@@ -1700,23 +1855,43 @@ def fetch_broker_queue(ctx: OpenQuoteContext, conn: sqlite3.Connection
     if ret != RET_OK:
         return None
 
-    def _front_id(frame, col: str) -> Optional[str]:
+    def _best_counts(frame, name_col: str, pos_col: str) -> dict:
+        """最优档(pos==min)各机构名的席位数 {name: count}。"""
         try:
-            if frame is None or getattr(frame, "empty", True) or col not in frame.columns:
-                return None
-            val = frame.iloc[0][col]
-            return None if val is None else str(val)
+            if frame is None or getattr(frame, "empty", True) \
+                    or name_col not in frame.columns or pos_col not in frame.columns:
+                return {}
+            best = frame[frame[pos_col] == frame[pos_col].min()]
+            counts: dict = {}
+            for nm in best[name_col].tolist():
+                if nm is None or str(nm).strip() == "":
+                    continue
+                counts[str(nm)] = counts.get(str(nm), 0) + 1
+            return counts
         except Exception:
-            return None
+            return {}
 
-    bid1_id = _front_id(bid_frame, "bid_broker_id")
-    ask1_id = _front_id(ask_frame, "ask_broker_id")
-    if bid1_id is None and ask1_id is None:
+    bid_cnt = _best_counts(bid_frame, "bid_broker_name", "bid_broker_pos")
+    ask_cnt = _best_counts(ask_frame, "ask_broker_name", "ask_broker_pos")
+    if not bid_cnt and not ask_cnt:
         return None
 
+    # 每侧取「本侧席位数 − 对侧席位数」最大的机构（净不对称 = 单边方向性，做市商两侧均衡→净≈0）
+    def _top_net(side_cnt: dict, other_cnt: dict) -> tuple[Optional[str], int]:
+        best_name, best_net = None, 0
+        for nm, c in side_cnt.items():
+            net = c - other_cnt.get(nm, 0)
+            if net > best_net:
+                best_name, best_net = nm, net
+        return best_name, best_net
+
+    bid_top_name, bid_top_net = _top_net(bid_cnt, ask_cnt)
+    ask_top_name, ask_top_net = _top_net(ask_cnt, bid_cnt)
+
     ts = datetime.datetime.now().isoformat(timespec="seconds")
-    db_save_broker(conn, ts, bid1_id, ask1_id)
-    return {"ts": ts, "bid1_id": bid1_id, "ask1_id": ask1_id}
+    db_save_broker(conn, ts, bid_top_name, bid_top_net, ask_top_name, ask_top_net)
+    return {"ts": ts, "bid_top_name": bid_top_name, "bid_top_net": bid_top_net,
+            "ask_top_name": ask_top_name, "ask_top_net": ask_top_net}
 
 
 def analyze_order_book(conn: sqlite3.Connection,
@@ -2856,6 +3031,16 @@ class MonitorState:
     # API 失败计数：连续失败 ≥ API_FAIL_TOLERANCE_ROUNDS 时跳过打分
     _capital_fail_count:   int         = 0
     _orderbook_fail_count: int         = 0
+    # L2 微观结构最新快照（迭代三十三：仪表盘 L2 面板）
+    latest_tick:    Optional[dict] = None  # fetch_ticks 返回：sell_vol/buy_vol/best_bid_vol/best_ask_vol
+    latest_broker:  Optional[dict] = None  # fetch_broker_queue 返回：bid_top_name/net、ask_top_name/net
+    latest_ice_sq:  int = 0                # 本轮冰山吸筹分（>0=买侧冰山吸筹）
+    latest_ice_sup: int = 0                # 本轮冰山派发分（>0=卖侧冰山派发）
+    latest_brk_sq:  int = 0                # 本轮经纪足迹买侧加成
+    latest_brk_sup: int = 0                # 本轮经纪足迹卖侧加成
+    latest_mf_score: int = 0               # 主力嫌疑分（控盘特征，纯背景画像）
+    latest_mf_label: str = "无明显控盘(市场化)"
+    latest_mf_sigs: list = field(default_factory=list)  # 命中的控盘子维度明细
 
 
 def print_dashboard(
@@ -2900,6 +3085,43 @@ def print_dashboard(
     else:
         exit_label = "   持仓安全  "
 
+    # ── L2 微观结构面板字符串（迭代三十三）────────────────────
+    tk = state.latest_tick
+    if tk:
+        bv, sv = tk.get("buy_vol", 0) or 0, tk.get("sell_vol", 0) or 0
+        if bv >= sv:
+            ratio = f"主买 {bv/sv:.1f}×" if sv > 0 else "主买 ∞"
+        else:
+            ratio = f"主卖 {sv/bv:.1f}×" if bv > 0 else "主卖 ∞"
+        l2_tick = f"买 {bv:,.0f} / 卖 {sv:,.0f} 股  ({ratio})"
+        l2_book = (f"买一 {tk.get('best_bid_vol',0) or 0:,.0f} / "
+                   f"卖一 {tk.get('best_ask_vol',0) or 0:,.0f} 股")
+    else:
+        l2_tick, l2_book = "—（逐笔无数据）", "—"
+    if state.latest_ice_sq > 0:
+        l2_ice = f"买侧吸筹 [+{state.latest_ice_sq}] 被动接货→抑制追空"
+    elif state.latest_ice_sup > 0:
+        l2_ice = f"卖侧派发 [+{state.latest_ice_sup}] 被动出货→支撑做空"
+    else:
+        l2_ice = "无"
+    brk = state.latest_broker
+    if brk and (brk.get("bid_top_name") or brk.get("ask_top_name")):
+        bn = (brk.get("bid_top_name") or "—")[:6]
+        an = (brk.get("ask_top_name") or "—")[:6]
+        bnet, anet = brk.get("bid_top_net", 0) or 0, brk.get("ask_top_net", 0) or 0
+        bmark = "▲" if state.latest_brk_sq > 0 else " "
+        amark = "▼" if state.latest_brk_sup > 0 else " "
+        l2_brk = f"买{bmark}{bn}+{bnet}  卖{amark}{an}+{anet} 席"
+    else:
+        l2_brk = "—（本轮无具名席位）"
+    l2_lines = [
+        f"[④] L2逐笔(主动): {l2_tick}",
+        f"      最优档挂量 : {l2_book}",
+        f"      L2冰山     : {l2_ice}",
+        f"      经纪净不对称: {l2_brk}",
+        f"[★] 主力嫌疑   : {state.latest_mf_score:3d}/100  {state.latest_mf_label}",
+    ]
+
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
@@ -2914,13 +3136,22 @@ def print_dashboard(
 ║  [③] 卖盘深度               : {str(f"{state.latest_ask_depth:,.0f} 股" if state.latest_ask_depth is not None else "N/A"):>16}             ║
 ║      摆盘失衡度             : {str(f"{state.latest_imbalance:+.3f}" if state.latest_imbalance is not None else "N/A"):>8}  10日成本: {str(f"{state.weighted_cost:.1f}" if state.weighted_cost else "N/A"):>7}  ║
 ║                                              20日成本: {str(f"{state.weighted_cost_mid:.1f}" if state.weighted_cost_mid else "N/A"):>7}  ║
-╠══════════════════════════════════════════════════════════╣
+╠══════════════════════════════════════════════════════════╣""")
+
+    for _l in l2_lines:
+        print(f"║  {_l[:54]:<54}  ║")
+    # 主力嫌疑命中明细（≥轻微控盘才展开，避免市场化票刷屏）
+    if state.latest_mf_score >= 20:
+        for s in state.latest_mf_sigs:
+            print(f"║   ★ {s}")
+
+    print(f"""╠══════════════════════════════════════════════════════════╣
 ║  【逼空风险】[{bar(squeeze_score)}] {squeeze_score:3d}/100        ║
 ║  {sq_level:<52}  ║""")
 
     if squeeze_signals:
         for s in squeeze_signals:
-            print(f"║   ⚠ {s[:52]:<52}  ║")
+            print(f"║   ⚠ {s}")
 
     # Bug 19：拆分展示做空总分 = 主信号（盘中此刻）+ 日级背景（整日固定）
     # 用户应关注主信号分，避免被日级地板 48 分顶高的总分误导
@@ -2931,13 +3162,13 @@ def print_dashboard(
 
     if short_sigs:
         for s in short_sigs:
-            print(f"║   → {s[:52]:<52}  ║")
+            print(f"║   → {s}")
 
     if state.in_position:
         print(f"""╠══════════════════════════════════════════════════════════╣
 ║  【持仓离场风险】紧迫度 {exit_urgency:3d}/100  {exit_label:<22}  ║""")
         for r in exit_reasons:
-            print(f"║   !! {r[:51]:<51}  ║")
+            print(f"║   !! {r}")
 
     # ── 手动持仓面板（--held-short 模式）────────────────────
     if cover_advice is not None and held is not None and state.last_price is not None:
@@ -2969,7 +3200,7 @@ def print_dashboard(
 ║  {action_label:<52}  ║""")
         for r in cover_advice.reasons:
             prefix = "!!" if cover_advice.action in ("COVER_ALL", "STOP_LOSS") else " →"
-            print(f"║ {prefix} {r[:54]:<54} ║")
+            print(f"║ {prefix} {r}")
 
     print("╚══════════════════════════════════════════════════════════╝")
 
@@ -3066,10 +3297,14 @@ def run_monitor(held_short: Optional[HeldShort] = None):
                 state._orderbook_fail_count += 1
 
             # ── L2 逐笔成交（Tier 1 冰山检测数据源；增强信号，失败不阻断）──
-            fetch_ticks(ctx, conn, ob)
+            tk = fetch_ticks(ctx, conn, ob)
+            if tk:
+                state.latest_tick = tk
             # ── L2 经纪队列（Tier 2 足迹；仅在 BROKER 订阅可用时拉取，LV1 自动跳过）──
             if broker_available:
-                fetch_broker_queue(ctx, conn)
+                bq = fetch_broker_queue(ctx, conn)
+                if bq:
+                    state.latest_broker = bq
 
             # ── 数据新鲜度守门：核心 API 连续失败 → 跳过打分 ──────
             # Futu API 失败时 state 旧值会被保留，若不守门则评分基于陈旧快照
@@ -3163,6 +3398,12 @@ def run_monitor(held_short: Optional[HeldShort] = None):
             # L2 经纪足迹（Tier 2）：单一席位反复占据最优档，仅在同向冰山已触发时加成
             s_brk_sq, s_brk_sup, sg_brk = analyze_broker_footprint(
                 conn, s_ice_sq, s_ice_sup)
+            # L2 面板快照（迭代三十三）：供仪表盘每轮展示当前微观结构状态
+            state.latest_ice_sq, state.latest_ice_sup = s_ice_sq, s_ice_sup
+            state.latest_brk_sq, state.latest_brk_sup = s_brk_sq, s_brk_sup
+            # 主力嫌疑分（控盘特征筛查，纯背景画像，不参与下方任何打分）
+            state.latest_mf_score, state.latest_mf_label, state.latest_mf_sigs = \
+                analyze_main_force_control(conn)
             # 散户 FOMO（窄幅震荡中加速流入）→ 支撑做空
             s_fomo, sg_fomo = analyze_retail_fomo(conn, state.last_price)
             # 中单拆单（大单冻结期间 mid_net 节奏稳定）→ 支撑做空
