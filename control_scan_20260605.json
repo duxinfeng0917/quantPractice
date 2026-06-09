@@ -1,0 +1,32 @@
+{
+  "scan_time": "2026-06-05T11:29:49.250162",
+  "probe": true,
+  "results": [
+    {
+      "code": "00100",
+      "name": "MINIMAX-W",
+      "last_price": 601.0,
+      "free_float_cap": 188494820108.0,
+      "total_market_cap": 188494820108.0,
+      "listing_date": "2026-01-09",
+      "listing_years": 0.4024640657084189,
+      "is_w_class": true,
+      "avg_daily_turnover": 1593626602.9,
+      "hkex_ratios": [
+        11.752753437598116,
+        2.9080457001549567,
+        2.2398508395512615,
+        5.970431199702233,
+        5.156303231094919
+      ],
+      "hkex_ratio_avg": 5.605476881620297,
+      "score": 0,
+      "breakdown": [],
+      "notes": [],
+      "incubator_score": 58,
+      "mf_score": 15,
+      "mf_label": "无明显控盘(市场化)",
+      "verdict": "温床符合，但盘中未见控盘足迹（非控盘时段/数据不足？）"
+    }
+  ]
+}

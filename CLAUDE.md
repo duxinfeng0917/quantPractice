@@ -24,6 +24,11 @@ python3 short_squeeze_monitor.py export     # 导出数据 CSV
 python3 short_position_manager.py --entry 897 --qty 1000 --stop 950  # 启动持仓管理器（00100）
 python3 short_position_manager.py --stock 02513 --entry 50 --qty 1000  # 切换股票
 python3 short_position_manager.py --cover --cover-qty 500 --cover-price 870  # 记录平仓
+
+# 选股筛选
+python3 watchlist_scanner.py                       # 逼空候选六维筛（静态，扫 WATCHLIST）
+python3 control_screener.py 00100 00981            # 控盘标的筛（静态温床分：次新小盘控盘 vs 流动性大盘）
+python3 control_screener.py --probe                # 加盘中控盘确认（主力嫌疑分，需开盘 + LV2 席位权限）
 ```
 
 ## Dependencies

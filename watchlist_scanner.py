@@ -32,7 +32,7 @@ import statistics
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from futu import OpenQuoteContext, RET_OK, Market, SecurityType, KLType
+from futu import OpenQuoteContext, RET_OK, Market, SecurityType, KLType, KL_FIELD
 
 from shared_config import WATCHLIST, STOCKS
 import short_squeeze_monitor as ssm  # 复用 scrape_hkex_short
@@ -163,7 +163,7 @@ def fetch_avg_turnover(ctx: OpenQuoteContext, code: str, cand: Candidate,
         sym,
         start=start.isoformat(), end=end.isoformat(),
         ktype=KLType.K_DAY, autype=None,
-        fields=["turnover"],
+        fields=[KL_FIELD.TRADE_VAL],   # 成交额；用字符串 "turnover" 会报 fields 类型错
         max_count=days * 2,
     )
     if ret != RET_OK or kl.empty:

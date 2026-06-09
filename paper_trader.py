@@ -351,8 +351,11 @@ def db_get_recent_hkex(conn: sqlite3.Connection, n: int) -> list[float]:
 
 def db_save_orderbook(conn: sqlite3.Connection, ts: str, bid: float,
                       ask: float, imb: float):
+    # 列名显式（迭代三十八）：monitor 已给 orderbook_snapshots 扩了 L2 十档形态列，
+    # positional VALUES 会因列数不符报错；只写基础 4 列、其余列留 NULL（由 monitor 填）。
     conn.execute(
-        "INSERT INTO orderbook_snapshots VALUES (NULL,?,?,?,?)",
+        "INSERT INTO orderbook_snapshots (ts, bid_depth, ask_depth, imbalance) "
+        "VALUES (?,?,?,?)",
         (ts, bid, ask, imb),
     )
     conn.commit()
