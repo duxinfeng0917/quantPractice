@@ -49,9 +49,11 @@ PYTHON="/Users/duxinfeng/miniconda3/envs/finance_env/bin/python"
 
 # ── 辅助函数 ──────────────────────────────────────────────
 start_monitor() {
-  # 检查同一股票的 monitor 是否已在运行
-  if pgrep -f "${MONITOR_SCRIPT}.*--stock ${STOCK}\|${MONITOR_SCRIPT}.*${STOCK}" > /dev/null 2>&1; then
-    echo "[警告] monitor(${STOCK}) 已在运行，PID: $(pgrep -f "${MONITOR_SCRIPT}.*${STOCK}")"
+  # 检查同一股票的 monitor 是否已在运行（pgrep 用扩展正则，单一模式即可，勿用 \|）
+  local running
+  running=$(pgrep -f "${MONITOR_SCRIPT}.*--stock ${STOCK}" || true)
+  if [[ -n "$running" ]]; then
+    echo "[警告] monitor(${STOCK}) 已在运行，PID: ${running//$'\n'/ }"
     echo "       如需重启，先运行: bash start.sh stop"
     return 1
   fi
@@ -63,8 +65,10 @@ start_monitor() {
 
 start_trader() {
   # $@ 接收额外参数（如 --dry-run --qty 500）
-  if pgrep -f "${TRADER_SCRIPT}.*--stock ${STOCK}\|${TRADER_SCRIPT}.*${STOCK}" > /dev/null 2>&1; then
-    echo "[警告] trader(${STOCK}) 已在运行，PID: $(pgrep -f "${TRADER_SCRIPT}.*${STOCK}")"
+  local running
+  running=$(pgrep -f "${TRADER_SCRIPT}.*--stock ${STOCK}" || true)
+  if [[ -n "$running" ]]; then
+    echo "[警告] trader(${STOCK}) 已在运行，PID: ${running//$'\n'/ }"
     echo "       如需重启，先运行: bash start.sh stop"
     return 1
   fi

@@ -2644,4 +2644,102 @@ Bug 25 的容差带写成 `abs(_bn - _anchor) <= abs(_anchor) × 6%`——锚点
 
 ---
 
-*本文档记录截止：2026-06-08。*
+## 迭代四十五：信号回测脚手架 + 回测驱动调权（2026-06-09）
+
+### 背景
+
+整套评分阈值一直是**手工标定、从未统计验证**。新增 `backtest_signals.py`：回放
+`signals`+`price_history`，统计每类 `signal_type` 触发后 +5/15/30/60min、当日/次日收盘的
+前向收益与胜率，并与无条件基线对比（`exc = μret − 基线`，剔除趋势漂移）。
+支持 `--all` 跨标的池化、`--rigor`（去重叠 30min + 块自助法，块=标的×交易日，95%CI）。
+
+### 回测结论（跨 5 标的，含 02513 +21.5% 上涨样本）
+
+朴素池化看似多个派发信号"3/3 同向"，但 `--rigor`（去重叠+块自助）后**绝大多数不显著**——
+裸胜率多是"同一天信号扎堆共享次日收盘"的聚类幻觉。稳健结论只有：
+- **ASK_DEPTH_SHRINK**（471事件/59块，最大独立样本）：各时段点估计≈0、CI 全跨 0 → **噪声**。
+- **ICEBERG_ACCUMULATION / BIG_FLOW_REBUY**（看多）：跨标的 0/3、点估计反向 → **无看多边际**。
+- 派发家族（ICEBERG_DISTRIBUTION 等）：方向对但去重叠后**不显著**，仅 RETAIL_RETREAT_HEAVY/
+  DISTRIBUTION_MODE 勉强显著且块数仅 6-11 → **保持，不加不减**。
+
+### 改动（`short_squeeze_monitor.py`）
+
+按"只砍证实为噪声/反向的，不给任何信号加码"原则，引入可调常量并降权（均不归零，留弱权重可回滚）：
+- `ASK_DEPTH_SHRINK_PTS` 25→12、`ASK_DEPTH_SHRINK_PTS_WEAK` 12→6。
+- 拆分冰山评分：买侧吸筹单列 `ICEBERG_ACCUM_STRONG_SCORE`=8 / `ICEBERG_ACCUM_WEAK_SCORE`=4
+  （原沿用派发的 15/8）；**卖侧派发仍用 ICEBERG_STRONG/WEAK_SCORE=15/8 不动**。
+- `BIG_FLOW_REBUY_PTS` 10→5。
+
+### 设计原则
+
+权重调整须经**块自助法显著性**验证；当前样本（块 5-59）只够"砍确认噪声"，**不够押确认 alpha**。
+随数据积累（更多标的/更长历史）复核。详见 [[signal-thresholds]]、[[known-bugs-and-gotchas]]。
+
+---
+
+## 迭代四十六：出货式拉升(做空 +20)三重计数 + 回测反向 → 归零中性化（2026-06-10）
+
+### Bug
+
+`compute_distribution_pump`（DISTRIBUTION_PUMP_SUSPECT，做空入场 +20）两处缺陷：
+1. **三重计数**：其门槛条件 `latest_ratio≥8 或 momentum≥1.5` 与 卖空动能比[+20]、卖空量爆量[+15]
+   **同源 HKEX 卖空数据**——一个数据点经三处入账。06-10 实盘：06-09 卖空 18.61% 一个事实就给
+   做空背景堆 ~55 分，做空分恒钉 85~100，仅靠"背景注水降级 CAUTION"挡住误报 ENTRY。
+2. **回测反向**：迭代四十五回测 DISTRIBUTION_PUMP_SUSPECT n=217，+60m/EOD/NXT 前向收益**全为正**
+   （NXT +0.23）——触发后价格反而偏涨（"高短空+反弹递减+大单流入"更像轧空前蓄势，非派发），
+   "支撑做空 +20" 方向是反的。
+
+### 改动（`short_squeeze_monitor.py`）
+
+新增 `DISTRIBUTION_PUMP_PTS = 0`（原 20）。强支链 `pts=DISTRIBUTION_PUMP_PTS`，仍 `db_save_signal`
+供回测追踪，但 `return pts, ([msg] if pts else [])` → 不计分、不进做空理由列表，消息改为"中性·回测
+反向不计分"。弱支链（+10，非 HKEX 门槛、无双计）保留不动。
+
+### 设计原则
+
+同一根因信号（HKEX 卖空主题）不应经多条规则重复入账；任一"支撑做空/做多"加分项若回测前向收益
+反向，应归零或反号，绝不保留。详见 [[known-bugs-and-gotchas]]。
+
+---
+
+## 迭代四十七：隐藏吸筹否决(Failsafe 4)二段分级 —— 强档双确认升级 BLOCKED（2026-06-10）
+
+### 动机（实盘教训）
+
+06-10 00100 全天单边走强 418→447（+6.6% 创日内新高），但"做空仪表盘"几乎全天 80~100 分误报：
+- 做空分由日级背景（空头深套 -34%、卖空爆量 5×、动能 3.47×）注水到 50，叠加盘口偏空/卖墙骤增
+  把主信号顶上去，恒在 80~100。
+- 真正正确的信号是 **Failsafe 4「中单(拆单)吸筹 + 价格印证」**：中单累计 +1,863→+3,032 万持续吸筹、
+  价格不断新高印证。但旧逻辑**仅把 ENTRY 降级 CAUTION**，CAUTION 是"观望"不是"禁止"，画面 100 分
+  持续闪烁，反复诱导追空。
+- 同日"卖侧冰山派发(花旗/荷银 17~50×)"在单边上涨里**沦为反指**——每次派发信号一出价格反创新高，
+  印证强趋势中机构卖一被动成交≈换手对手盘而非出货。
+
+结论：**吸筹水位大且价格印证强时，CAUTION 不足以遏制背景注水高分，须直接禁空。**
+
+### 改动（`short_squeeze_monitor.py`）
+
+Failsafe 4（`apply_short_entry_failsafes`，SHORT_MID_ACCUM_*）由"单档降级"改为**二段分级**：
+
+- **弱档**（`accel 或 level`、价涨 ≥ `MID_ACCUM_PRICE_RISE_PCT`=0.2%）→ ENTRY 降级 CAUTION（原行为不变）。
+- **强档**（`mid_latest ≥ MID_ACCUM_MIN_LEVEL × MID_ACCUM_STRONG_LEVEL_MULT(=2.0)`
+  **且** 价涨 ≥ `MID_ACCUM_STRONG_PRICE_RISE_PCT`(=0.5%)）→ **直接 BLOCKED 禁止开空**
+  （与 Failsafe 2 同形：`return 0, "BLOCKED", [reason]`，signal 类型 `SHORT_MID_ACCUM_BLOCK`）。
+
+触发门由 `sig_type == "ENTRY"` 放宽到 `sig_type in ("ENTRY","CAUTION")`——背景注水的高分常已先被
+其它 failsafe 压成 CAUTION，需允许从 CAUTION 进一步升级 BLOCKED。
+
+### 不伤害合法做空的保证
+
+本 failsafe 全程要求 `price_rise_pct > 0`（价格印证上行）。**合法做空发生在价格下跌时**
+（如同日晨盘 430→418，price_rise_pct 为负），强/弱档**天然都不触发**，故晨盘那笔真实做空完全不受影响。
+
+### 设计原则
+
+当某维度被实盘证明是该标的当日的"正确方向信号"，而其它高分维度被证为背景注水/反指时，
+该维度应有权**升级到 BLOCKED**，而非止步于 CAUTION——"观望"挡不住持续闪烁的注水高分。
+强档须双确认（水位 + 价格印证）以控误杀。详见 [[signal-thresholds]]、[[feedback-price-action-over-score]]。
+
+---
+
+*本文档记录截止：2026-06-10。*
