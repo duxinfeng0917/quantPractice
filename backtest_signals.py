@@ -46,6 +46,20 @@ DIRECTION = {
     "SELL_NO_DROP":           "BEAR",
     # —— 看多 / 吸筹 / 逼空 ——
     "ICEBERG_ACCUMULATION":   "BULL",
+    "VWAP_CROSS_UP":          "BULL",   # 价上穿日内 VWAP（待积累数据后验证，纯记录无评分）
+    "VWAP_CROSS_DOWN":        "BEAR",   # 价下穿日内 VWAP
+    "VOLPRICE_BULL_DIV":      "BULL",   # 价创日内新低但缩量=抛压枯竭（迭代五十一，纯记录待验证）
+    "VOLPRICE_BEAR_DIV":      "BEAR",   # 价创日内新高但缩量=动能枯竭
+    "CLOSING_ACCUM":          "BULL",   # 尾盘机构吸筹收尾=隔夜偏多（迭代五十二，纯记录待验证）
+    "CLOSING_DISTRIB":        "BEAR",   # 尾盘机构派发收尾=隔夜偏空
+    "ICEBERG_EXHAUST_SELL":   "BULL",   # 卖侧冰山补单衰减=派发供给枯竭（迭代五十三，纯记录待验证）
+    "ICEBERG_EXHAUST_BUY":    "BEAR",   # 买侧冰山补单衰减=吸筹承接枯竭
+    "BID_WALL_LIFT":          "BULL",   # 买墙连升=主力抬承接位
+    "ASK_WALL_PRESS":         "BEAR",   # 卖墙连降=主力压封顶位
+    "ALGO_RHYTHM_BUY":        "BULL",   # 匀速algo+主动净买=耐心机构吸筹（迭代五十四，纯记录待验证）
+    "ALGO_RHYTHM_SELL":       "BEAR",   # 匀速algo+主动净卖=耐心机构派发
+    "VWAP_BAND_LOWER":        "BULL",   # 触 VWAP 下轨=偏离过度（均值回归向上，待验证）
+    "VWAP_BAND_UPPER":        "BEAR",   # 触 VWAP 上轨=偏离过度（均值回归向下，待验证）
     "BROKER_FOOTPRINT_BID":   "BULL",
     "ASK_DEPTH_SHRINK":       "BULL",
     "BIG_FLOW_REBUY":         "BULL",

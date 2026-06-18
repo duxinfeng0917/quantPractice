@@ -96,6 +96,7 @@ CALIBRATABLE: dict[str, str] = {
     "MID_ACCUM_MIN_LEVEL":            "flow",  # 中单吸筹：累计显著多头水位
     "DISTRIBUTION_BIGNET_MIN_DEPTH":  "flow",  # 派发：大单日内最低值深度门槛
     "DISTRIBUTION_MIDSMALL_MIN_PEAK": "flow",  # 派发：中小单峰值门槛
+    "TAIL_FLOW_MIN_DELTA":            "flow",  # 尾盘动向：大单/中单净变化显著门槛（迭代五十二）
     # —— 股数(随流通盘/股价放缩) → depth ——
     "MF_THIN_DEPTH_SHARES":           "depth", # 主力嫌疑：盘薄易控股数
     "THIN_ASK_DEPTH_FOR_FLIP_SKIP":   "depth", # 翻转 failsafe 豁免：薄盘股数
